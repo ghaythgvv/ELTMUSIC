@@ -1,0 +1,438 @@
+require('dotenv').config();
+
+const { Client, GatewayIntentBits, EmbedBuilder, MessageFlags } = require('discord.js');
+const { Player, QueueRepeatMode } = require('discord-player');
+const { DefaultExtractors } = require('@discord-player/extractor');
+const { YoutubeiExtractor } = require('discord-player-youtubei');
+
+// ───────────── CONFIG ─────────────
+const TOKEN = process.env.DISCORD_TOKEN;
+const PREFIX = process.env.PREFIX || '!';
+const DEFAULT_VOLUME = Math.min(100, Math.max(1, parseInt(process.env.DEFAULT_VOLUME, 10) || 50));
+const GUILD_ID = process.env.GUILD_ID || '';
+const COLOR = 0x9b59b6; // purple
+
+if (!TOKEN) {
+  console.error('❌ DISCORD_TOKEN is missing. Add it in Railway → your service → Variables.');
+  process.exit(1);
+}
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+  ],
+});
+
+const player = new Player(client);
+
+// ───────────── HELPERS ─────────────
+const box = (text) => ({ embeds: [new EmbedBuilder().setColor(COLOR).setDescription(text)] });
+const err = (text) => box(`❌ ${text}`);
+const ok = (text) => box(`✅ ${text}`);
+
+const getQueue = (guild) => player.nodes.get(guild.id);
+
+// Checks the user is in the same voice channel as the bot. Returns the queue or null (and replies).
+async function requireQueue(ctx, { needPlaying = true } = {}) {
+  const vc = ctx.member.voice.channel;
+  if (!vc) {
+    await ctx.reply(err('Join a voice channel first.'));
+    return null;
+  }
+  const queue = getQueue(ctx.guild);
+  if (!queue || (needPlaying && !queue.currentTrack)) {
+    await ctx.reply(err('Nothing is playing right now.'));
+    return null;
+  }
+  const botVc = ctx.guild.members.me.voice.channel;
+  if (botVc && botVc.id !== vc.id) {
+    await ctx.reply(err(`You need to be in ${botVc} to use this.`));
+    return null;
+  }
+  return queue;
+}
+
+// ───────────── COMMANDS ─────────────
+// arg: { name, type: 'string' | 'number', required, description, choices }
+const commands = [
+  {
+    name: 'play',
+    aliases: ['p'],
+    description: 'Play a song or playlist (name or link)',
+    arg: { name: 'query', type: 'string', required: true, description: 'Song name or link' },
+    async run(ctx, a) {
+      const query = String(a.query || '').trim();
+      if (!query) return ctx.reply(err(`Give me a song name or link. Example: \`${PREFIX}play lofi hip hop\``));
+
+      const vc = ctx.member.voice.channel;
+      if (!vc) return ctx.reply(err('Join a voice channel first.'));
+      const botVc = ctx.guild.members.me.voice.channel;
+      if (botVc && botVc.id !== vc.id) return ctx.reply(err(`I'm already playing in ${botVc}.`));
+
+      await ctx.defer();
+      try {
+        const res = await player.play(vc, query, {
+          requestedBy: ctx.user,
+          nodeOptions: {
+            metadata: { channel: ctx.channel },
+            volume: DEFAULT_VOLUME,
+            selfDeaf: true,
+            leaveOnEmpty: true,
+            leaveOnEmptyCooldown: 60_000,
+            leaveOnEnd: true,
+            leaveOnEndCooldown: 60_000,
+            leaveOnStop: true,
+          },
+        });
+        const playlist = res.searchResult?.playlist;
+        if (playlist) {
+          return ctx.reply(ok(`Queued playlist **${playlist.title}** (${playlist.tracks.length} tracks)`));
+        }
+        return ctx.reply(ok(`Queued [${res.track.title}](${res.track.url})`));
+      } catch (e) {
+        console.error('Play error:', e);
+        return ctx.reply(err('I could not find or play that. Try another name or link.'));
+      }
+    },
+  },
+  {
+    name: 'skip',
+    aliases: ['s', 'next'],
+    description: 'Skip the current song',
+    async run(ctx) {
+      const queue = await requireQueue(ctx);
+      if (!queue) return;
+      const title = queue.currentTrack.title;
+      queue.node.skip();
+      return ctx.reply(ok(`Skipped **${title}**`));
+    },
+  },
+  {
+    name: 'stop',
+    aliases: ['leave', 'disconnect', 'dc'],
+    description: 'Stop the music and leave the voice channel',
+    async run(ctx) {
+      const queue = await requireQueue(ctx, { needPlaying: false });
+      if (!queue) return;
+      queue.delete();
+      return ctx.reply(ok('Stopped the music and left the channel.'));
+    },
+  },
+  {
+    name: 'pause',
+    description: 'Pause the music',
+    async run(ctx) {
+      const queue = await requireQueue(ctx);
+      if (!queue) return;
+      if (queue.node.isPaused()) return ctx.reply(err('Already paused.'));
+      queue.node.setPaused(true);
+      return ctx.reply(ok('Paused.'));
+    },
+  },
+  {
+    name: 'resume',
+    aliases: ['unpause'],
+    description: 'Resume the music',
+    async run(ctx) {
+      const queue = await requireQueue(ctx);
+      if (!queue) return;
+      if (!queue.node.isPaused()) return ctx.reply(err('The music is not paused.'));
+      queue.node.setPaused(false);
+      return ctx.reply(ok('Resumed.'));
+    },
+  },
+  {
+    name: 'nowplaying',
+    aliases: ['np', 'current'],
+    description: 'Show the current song',
+    async run(ctx) {
+      const queue = getQueue(ctx.guild);
+      if (!queue?.currentTrack) return ctx.reply(err('Nothing is playing right now.'));
+      const t = queue.currentTrack;
+      const embed = new EmbedBuilder()
+        .setColor(COLOR)
+        .setTitle('Now Playing')
+        .setDescription(`[${t.title}](${t.url})\nby **${t.author}**\n\n${queue.node.createProgressBar()}`)
+        .setFooter({ text: `Requested by ${t.requestedBy?.username || 'unknown'}` });
+      if (t.thumbnail) embed.setThumbnail(t.thumbnail);
+      return ctx.reply({ embeds: [embed] });
+    },
+  },
+  {
+    name: 'queue',
+    aliases: ['q'],
+    description: 'Show the queue',
+    async run(ctx) {
+      const queue = getQueue(ctx.guild);
+      if (!queue?.currentTrack) return ctx.reply(err('The queue is empty.'));
+      const tracks = queue.tracks.toArray();
+      const lines = tracks.slice(0, 10).map((t, i) => `\`${i + 1}.\` [${t.title}](${t.url}) • ${t.duration}`);
+      const more = tracks.length > 10 ? `\n…and **${tracks.length - 10}** more` : '';
+      const embed = new EmbedBuilder()
+        .setColor(COLOR)
+        .setTitle('Queue')
+        .setDescription(
+          `**Now playing:** [${queue.currentTrack.title}](${queue.currentTrack.url})\n\n` +
+            (lines.length ? lines.join('\n') + more : 'No songs up next.')
+        );
+      return ctx.reply({ embeds: [embed] });
+    },
+  },
+  {
+    name: 'volume',
+    aliases: ['vol'],
+    description: 'Set the volume (1-100)',
+    arg: { name: 'amount', type: 'number', required: false, description: 'Volume from 1 to 100' },
+    async run(ctx, a) {
+      const queue = await requireQueue(ctx);
+      if (!queue) return;
+      if (a.amount === undefined || a.amount === null || Number.isNaN(a.amount)) {
+        return ctx.reply(box(`🔊 Current volume: **${queue.node.volume}%**`));
+      }
+      if (a.amount < 1 || a.amount > 100) return ctx.reply(err('Volume must be between 1 and 100.'));
+      queue.node.setVolume(a.amount);
+      return ctx.reply(ok(`Volume set to **${a.amount}%**`));
+    },
+  },
+  {
+    name: 'loop',
+    aliases: ['repeat'],
+    description: 'Set loop mode: off, track, queue or autoplay',
+    arg: {
+      name: 'mode',
+      type: 'string',
+      required: true,
+      description: 'off, track, queue or autoplay',
+      choices: ['off', 'track', 'queue', 'autoplay'],
+    },
+    async run(ctx, a) {
+      const queue = await requireQueue(ctx);
+      if (!queue) return;
+      const modes = {
+        off: QueueRepeatMode.OFF,
+        track: QueueRepeatMode.TRACK,
+        queue: QueueRepeatMode.QUEUE,
+        autoplay: QueueRepeatMode.AUTOPLAY,
+      };
+      const mode = String(a.mode || '').toLowerCase();
+      if (!(mode in modes)) return ctx.reply(err('Use: `off`, `track`, `queue` or `autoplay`.'));
+      queue.setRepeatMode(modes[mode]);
+      return ctx.reply(ok(`Loop mode: **${mode}**`));
+    },
+  },
+  {
+    name: 'shuffle',
+    description: 'Shuffle the queue',
+    async run(ctx) {
+      const queue = await requireQueue(ctx);
+      if (!queue) return;
+      if (queue.tracks.size < 2) return ctx.reply(err('Not enough songs in the queue to shuffle.'));
+      queue.tracks.shuffle();
+      return ctx.reply(ok('Queue shuffled.'));
+    },
+  },
+  {
+    name: 'remove',
+    description: 'Remove a song from the queue by its number',
+    arg: { name: 'position', type: 'number', required: true, description: 'Song number in the queue' },
+    async run(ctx, a) {
+      const queue = await requireQueue(ctx);
+      if (!queue) return;
+      const pos = a.position;
+      if (!pos || pos < 1 || pos > queue.tracks.size) return ctx.reply(err('That position is not in the queue.'));
+      const removed = queue.removeTrack(pos - 1);
+      return ctx.reply(ok(`Removed **${removed?.title || 'song'}**`));
+    },
+  },
+  {
+    name: 'skipto',
+    description: 'Skip to a song in the queue',
+    arg: { name: 'position', type: 'number', required: true, description: 'Song number in the queue' },
+    async run(ctx, a) {
+      const queue = await requireQueue(ctx);
+      if (!queue) return;
+      const pos = a.position;
+      if (!pos || pos < 1 || pos > queue.tracks.size) return ctx.reply(err('That position is not in the queue.'));
+      queue.node.skipTo(pos - 1);
+      return ctx.reply(ok(`Skipped to song **#${pos}**`));
+    },
+  },
+  {
+    name: 'seek',
+    description: 'Jump to a time in the current song (seconds)',
+    arg: { name: 'seconds', type: 'number', required: true, description: 'Time in seconds' },
+    async run(ctx, a) {
+      const queue = await requireQueue(ctx);
+      if (!queue) return;
+      if (a.seconds === undefined || Number.isNaN(a.seconds) || a.seconds < 0) {
+        return ctx.reply(err('Give me a time in seconds.'));
+      }
+      try {
+        await queue.node.seek(a.seconds * 1000);
+        return ctx.reply(ok(`Jumped to **${a.seconds}s**`));
+      } catch {
+        return ctx.reply(err('I could not seek in this song.'));
+      }
+    },
+  },
+  {
+    name: 'clear',
+    description: 'Clear the queue (keeps the current song)',
+    async run(ctx) {
+      const queue = await requireQueue(ctx);
+      if (!queue) return;
+      queue.tracks.clear();
+      return ctx.reply(ok('Queue cleared.'));
+    },
+  },
+  {
+    name: 'help',
+    aliases: ['h', 'commands'],
+    description: 'Show all commands',
+    async run(ctx) {
+      const list = commands
+        .map((c) => `\`${PREFIX}${c.name}\` or \`/${c.name}\` — ${c.description}`)
+        .join('\n');
+      const embed = new EmbedBuilder().setColor(COLOR).setTitle('Music Commands').setDescription(list);
+      return ctx.reply({ embeds: [embed] });
+    },
+  },
+];
+
+const byName = new Map();
+for (const c of commands) {
+  byName.set(c.name, c);
+  for (const al of c.aliases || []) byName.set(al, c);
+}
+
+// ───────────── CONTEXT WRAPPERS (same command code for slash + prefix) ─────────────
+function slashCtx(i) {
+  return {
+    user: i.user,
+    member: i.member,
+    guild: i.guild,
+    channel: i.channel,
+    defer: () => i.deferReply(),
+    reply: (p) => (i.deferred || i.replied ? i.editReply(p) : i.reply(p)),
+  };
+}
+
+function prefixCtx(m) {
+  return {
+    user: m.author,
+    member: m.member,
+    guild: m.guild,
+    channel: m.channel,
+    defer: () => m.channel.sendTyping().catch(() => {}),
+    reply: (p) => {
+      const payload = typeof p === 'string' ? { content: p } : p;
+      return m.reply({ ...payload, allowedMentions: { repliedUser: false } });
+    },
+  };
+}
+
+// ───────────── PLAYER EVENTS ─────────────
+player.events.on('playerStart', (queue, track) => {
+  const embed = new EmbedBuilder()
+    .setColor(COLOR)
+    .setTitle('Now Playing')
+    .setDescription(`[${track.title}](${track.url})\nby **${track.author}** • ${track.duration}`)
+    .setFooter({ text: `Requested by ${track.requestedBy?.username || 'unknown'}` });
+  if (track.thumbnail) embed.setThumbnail(track.thumbnail);
+  queue.metadata?.channel?.send({ embeds: [embed] }).catch(() => {});
+});
+
+player.events.on('emptyQueue', (queue) => {
+  queue.metadata?.channel?.send(box('The queue has finished. Add more songs with `' + PREFIX + 'play`.')).catch(() => {});
+});
+
+player.events.on('error', (queue, error) => console.error('Queue error:', error));
+player.events.on('playerError', (queue, error) => {
+  console.error('Player error:', error);
+  queue.metadata?.channel?.send(err('Something went wrong while playing that song, skipping.')).catch(() => {});
+});
+
+// ───────────── EVENTS ─────────────
+client.once('ready', async () => {
+  console.log(`✅ Logged in as ${client.user.tag}`);
+
+  await player.extractors.loadMulti(DefaultExtractors);
+  await player.extractors.register(YoutubeiExtractor, {});
+  console.log('✅ Extractors loaded.');
+
+  const body = commands.map((c) => ({
+    name: c.name,
+    description: c.description,
+    options: c.arg
+      ? [
+          {
+            type: c.arg.type === 'number' ? 4 : 3, // 4 = integer, 3 = string
+            name: c.arg.name,
+            description: c.arg.description,
+            required: !!c.arg.required,
+            ...(c.arg.choices ? { choices: c.arg.choices.map((x) => ({ name: x, value: x })) } : {}),
+          },
+        ]
+      : [],
+  }));
+
+  try {
+    if (GUILD_ID) {
+      const guild = await client.guilds.fetch(GUILD_ID);
+      await guild.commands.set(body);
+      console.log('✅ Slash commands registered for your server.');
+    } else {
+      await client.application.commands.set(body);
+      console.log('✅ Slash commands registered globally (can take up to an hour to show).');
+    }
+  } catch (e) {
+    console.error('❌ Could not register slash commands:', e.message);
+  }
+
+  client.user.setPresence({ activities: [{ name: `${PREFIX}help | /help` }] });
+});
+
+client.on('interactionCreate', async (i) => {
+  if (!i.isChatInputCommand() || !i.guild) return;
+  const cmd = byName.get(i.commandName);
+  if (!cmd) return;
+  const args = cmd.arg ? { [cmd.arg.name]: i.options.get(cmd.arg.name)?.value } : {};
+  try {
+    await cmd.run(slashCtx(i), args);
+  } catch (e) {
+    console.error('Slash command error:', e);
+    const msg = { ...err('Something went wrong.'), flags: MessageFlags.Ephemeral };
+    if (i.deferred || i.replied) i.followUp(msg).catch(() => {});
+    else i.reply(msg).catch(() => {});
+  }
+});
+
+client.on('messageCreate', async (m) => {
+  if (m.author.bot || !m.guild || !m.content.startsWith(PREFIX)) return;
+  const [name, ...rest] = m.content.slice(PREFIX.length).trim().split(/\s+/);
+  const cmd = byName.get((name || '').toLowerCase());
+  if (!cmd) return;
+
+  const text = rest.join(' ').trim();
+  let args = {};
+  if (cmd.arg) {
+    args[cmd.arg.name] = cmd.arg.type === 'number' ? (text ? Number(text) : undefined) : text;
+  }
+  try {
+    await cmd.run(prefixCtx(m), args);
+  } catch (e) {
+    console.error('Prefix command error:', e);
+    m.reply(err('Something went wrong.')).catch(() => {});
+  }
+});
+
+client.on('error', (e) => console.error('Client error:', e));
+process.on('unhandledRejection', (e) => console.error('Unhandled rejection:', e));
+
+client.login(TOKEN).catch((e) => {
+  console.error(`❌ Login failed: ${e.message}. The token is wrong or was reset — paste the NEW token in Railway Variables.`);
+  process.exit(1);
+});
