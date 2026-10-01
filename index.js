@@ -304,6 +304,14 @@ const commands = [
     },
   },
   {
+    name: 'deps',
+    description: 'Show the audio dependency report (for debugging)',
+    async run(ctx) {
+      const report = String(player.scanDeps()).slice(0, 1800);
+      return ctx.reply('```\n' + report + '\n```');
+    },
+  },
+  {
     name: 'help',
     aliases: ['h', 'commands'],
     description: 'Show all commands',
