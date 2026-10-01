@@ -395,6 +395,11 @@ player.events.on('playerStart', (queue, track) => {
   queue.metadata?.channel?.send({ embeds: [embed] }).catch(() => {});
 });
 
+player.events.on('playerFinish', (queue, track) => console.log(`[FINISH] ${track.title} (${track.duration})`));
+player.events.on('audioTrackAdd', (queue, track) => console.log(`[ADDED] ${track.title} | ${track.duration} | ${track.url}`));
+player.events.on('connection', () => console.log('[VOICE] connected'));
+player.events.on('disconnect', () => console.log('[VOICE] disconnected'));
+
 player.events.on('emptyQueue', (queue) => {
   queue.metadata?.channel?.send(box('The queue has finished. Add more songs with `' + PREFIX + 'play`.')).catch(() => {});
 });
@@ -412,7 +417,7 @@ player.events.on('playerSkip', (queue, track, reason, description) => {
   queue.metadata?.channel?.send(err(`I could not stream **${track.title}** (${reason}).`)).catch(() => {});
 });
 
-if (process.env.DEBUG_PLAYER) {
+if (process.env.DEBUG_PLAYER !== '0') {
   player.events.on('debug', (queue, message) => console.log(`[DEBUG ${queue.guild.name}] ${message}`));
   player.on('debug', (message) => console.log(`[DEBUG player] ${message}`));
 }
