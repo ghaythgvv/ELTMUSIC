@@ -375,6 +375,9 @@ player.events.on('playerSkip', (queue, track, reason, description) => {
   queue.metadata?.channel?.send(err(`I could not stream **${track.title}** (${reason}).`)).catch(() => {});
 });
 
+player.events.on('debug', (queue, message) => console.log(`[DEBUG ${queue.guild.name}] ${message}`));
+player.on('debug', (message) => console.log(`[DEBUG player] ${message}`));
+
 // ───────────── EVENTS ─────────────
 client.once('ready', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
