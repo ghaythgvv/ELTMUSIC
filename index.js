@@ -322,60 +322,6 @@ const commands = [
           disableBiquad: true,
           disableResampler: true,
           disableFilterer: true,
-          onBeforeCreateStream: async (track) => {
-            if (!/soundcloud\.com/i.test(track.url)) return null;
-
-            try {
-              const sc = player.extractors.get('com.discord-player.soundcloudextractor');
-              if (!sc) {
-                slog('[STREAM] SoundCloud extractor not found');
-                return null;
-              }
-
-              // 1) Plain mp3 download
-              try {
-                const link = await sc.internal.util.streamLink(track.url, 'progressive');
-                if (!link) throw new Error('no progressive link');
-
-                const res = await fetch(link, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-                if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
-
-                slog(`[STREAM] ${track.title} | progressive mp3 | ${res.headers.get('content-type')}`);
-                return Readable.fromWeb(res.body);
-              } catch (e) {
-                slog(`[STREAM] ${track.title} | progressive failed: ${e.message} -> trying HLS`);
-              }
-
-              // 2) HLS playlist: our own ffmpeg copies the audio (no re-encode) and hands it on
-              try {
-                if (!ffmpegPath) throw new Error('ffmpeg-static missing');
-
-                const link = await sc.internal.util.streamLink(track.url, 'hls');
-                if (!link) throw new Error('no hls link');
-
-                const ff = spawn(ffmpegPath, [
-                  '-hide_banner', '-loglevel', 'error',
-                  '-user_agent', 'Mozilla/5.0',
-                  '-i', link,
-                  '-vn', '-c:a', 'copy',
-                  '-f', 'mpegts', 'pipe:1'
-                ]);
-
-                ff.stderr.on('data', (d) => slog(`[STREAM][hls] ${String(d).trim().slice(0, 200)}`));
-                ff.on('error', (e) => slog(`[STREAM][hls] spawn error: ${e.message}`));
-                ff.stdout.on('close', () => ff.kill('SIGKILL'));
-
-                slog(`[STREAM] ${track.title} | HLS via ffmpeg`);
-                return ff.stdout;
-              } catch (e) {
-                slog(`[STREAM] ${track.title} | HLS failed: ${e.message} -> default stream`);
-              }
-            } catch (e) {
-              console.error('[STREAM] onBeforeCreateStream error:', e.message);
-            }
-
-            return null;
-          },
         },
       };
 
@@ -808,14 +754,11 @@ player.events.on('playerFinish', (queue, track) => {
   const elapsed = Date.now() - (startedAt.get(queue.guild.id) || 0);
   console.log(`[FINISH] ${track.title} (${track.duration}) after ${Math.round(elapsed / 1000)}s`);
 
-  if (elapsed < 5000 && track.durationMS > 20_000) {
-    const dump = recentDebug.slice(-14).join('\n').slice(-1500);
-    queue.metadata?.channel
-      ?.send({
-        ...err('The audio stream ended instantly. Debug info below:'),
-        content: '```\n' + dump + '\n```',
-      })
-      .catch(() => {});
+  // Only send error message if song finished TOO quickly (< 3s) and it's a long song
+  // This prevents spam when songs legitimately finish
+  if (elapsed < 3000 && track.durationMS > 20_000) {
+    console.error(`[ERROR] Track finished instantly: ${track.title} (expected ${track.duration})`);
+    // Don't spam Discord - just log it
   }
 });
 
