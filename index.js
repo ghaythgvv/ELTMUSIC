@@ -113,7 +113,7 @@ async function spotifyEmbedTracks(url) {
 }
 
 // ───────────── SOUNDCLOUD MATCHING (avoid remixes / previews / wrong songs) ─────────────
-const BAD_WORDS = /\b(remix|slowed|sped ?up|speed ?up|nightcore|cover|live|mashup|bootleg|edit|reverb|8d|bass ?boost(?:ed)?|instrumental|karaoke|acoustic|flip|vip|lofi)\b/i;
+const BAD_WORDS = /\b(remix|slowed|sped ?up|speed ?up|nightcore|cover|live|mashup|bootleg|edit|reverb|8d|bass ?boost(?:ed)?|instrumental|karaoke|acoustic|flip|vip|lofi|rework|remaster|version|but its|but it's|refix|reprise|demo)\b/i;
 const norm = (x) =>
   String(x || '')
     .toLowerCase()
@@ -128,29 +128,63 @@ function scoreTrack(t, want) {
   if (!t || !want) return -Infinity;
 
   const rt = norm(t.title);
+  const ra = norm(t.author);
   const wt = norm(want.title);
+  const wa = norm(want.author);
   let score = 0;
 
-  if (wt && rt.includes(wt)) score += 50;
-  else {
+  // TITLE MATCHING (max 60 points)
+  if (wt && rt === wt) {
+    score += 60; // Exact title match
+  } else if (wt && rt.includes(wt)) {
+    score += 45; // Title is contained
+  } else if (wt && wt.includes(rt) && rt.length > 4) {
+    score += 35; // Reversed containment (SoundCloud title is subset)
+  } else {
+    // Word-by-word matching
     const tok = wt.split(' ').filter(Boolean);
     const hit = tok.filter((x) => rt.includes(x)).length;
-    score += tok.length ? Math.round((30 * hit) / tok.length) : 0;
+    score += tok.length ? Math.round((25 * hit) / tok.length) : 0;
   }
 
-  const artistTok = norm(want.author).split(' ').filter((x) => x.length > 2);
-  if (artistTok.length && artistTok.some((x) => `${rt} ${norm(t.author)}`.includes(x))) score += 20;
+  // ARTIST MATCHING (max 30 points)
+  if (wa) {
+    const artistTok = wa.split(' ').filter((x) => x.length > 2);
+    const combined = `${rt} ${ra}`;
 
-  // Don't pick remixes/slowed/etc. unless that is what was asked for.
-  if (!BAD_WORDS.test(String(want.title)) && BAD_WORDS.test(String(t.title))) score -= 100;
+    if (ra === wa) {
+      score += 30; // Exact artist match
+    } else if (ra.includes(wa) || wa.includes(ra)) {
+      score += 25; // Artist name contained
+    } else if (artistTok.length) {
+      const artistHit = artistTok.filter((x) => combined.includes(x)).length;
+      score += artistTok.length ? Math.round((20 * artistHit) / artistTok.length) : 0;
+    }
+  }
 
-  if (want.durationMS) {
+  // PENALTY: Don't pick remixes/covers/edits unless that's what was requested
+  if (!BAD_WORDS.test(String(want.title)) && BAD_WORDS.test(String(t.title))) {
+    score -= 150; // Increased penalty
+  }
+
+  // DURATION MATCHING (important for distinguishing originals from remixes)
+  if (want.durationMS && want.durationMS > 0) {
     const d = Math.abs((t.durationMS || 0) - want.durationMS);
-    score += d <= 10_000 ? 40 : d <= 25_000 ? 20 : d > 60_000 ? -20 : 0;
+    if (d <= 5_000) score += 50;        // Within 5s (very close)
+    else if (d <= 15_000) score += 30;  // Within 15s (close)
+    else if (d <= 30_000) score += 10;  // Within 30s (acceptable)
+    else if (d > 90_000) score -= 50;   // More than 90s off (probably wrong version)
   }
 
-  // 30-90s label previews
-  if ((t.durationMS || 0) < 100_000 && !(want.durationMS && want.durationMS < 100_000)) score -= 40;
+  // PENALTY: 30-120s tracks are usually previews/snippets (unless the original is short)
+  if ((t.durationMS || 0) < 120_000 && want.durationMS && want.durationMS >= 120_000) {
+    score -= 60;
+  }
+
+  // PENALTY: Extremely long tracks (>10min) are usually DJ sets or extended mixes
+  if ((t.durationMS || 0) > 600_000 && (!want.durationMS || want.durationMS < 600_000)) {
+    score -= 40;
+  }
 
   return score;
 }
@@ -174,6 +208,7 @@ async function findOnSoundCloud(want, requestedBy, { strict = false } = {}) {
   const firstArtist = String(w.author || '').split(/,|&| feat\.? | x /i)[0].trim();
   const queries = [...new Set([`${firstArtist} ${w.title}`.trim(), `${w.title} ${w.author || ''}`.trim(), w.title])];
   let fallback = null;
+  let allTracks = [];
 
   for (const q of queries) {
     const tracks = await searchSoundCloud(q, requestedBy);
@@ -184,14 +219,42 @@ async function findOnSoundCloud(want, requestedBy, { strict = false } = {}) {
 
     for (const t of tracks) {
       const sc = scoreTrack(t, w);
+      allTracks.push({ track: t, score: sc, query: q });
+
       if (sc > bestScore) {
         best = t;
         bestScore = sc;
       }
     }
 
-    if (best && bestScore >= 30) return best;
-    if (!fallback) fallback = tracks.find((t) => t.durationMS >= 120_000) || tracks[0] || null;
+    // Log top 3 matches for debugging
+    const sorted = allTracks
+      .filter((x) => x.query === q)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 3);
+
+    console.log(`[SOUNDCLOUD] Query: "${q}"`);
+    sorted.forEach((x, i) => {
+      console.log(`  ${i + 1}. [${x.score}pts] ${x.track.title} by ${x.track.author} (${Math.round((x.track.durationMS || 0) / 1000)}s)`);
+    });
+
+    // Require higher score in strict mode (60+ points = good match)
+    const minScore = strict ? 60 : 30;
+    if (best && bestScore >= minScore) {
+      console.log(`[SOUNDCLOUD] ✓ Selected: ${best.title} (${bestScore}pts)`);
+      return best;
+    }
+
+    // Keep fallback for non-strict mode
+    if (!fallback && !strict) {
+      fallback = tracks.find((t) => t.durationMS >= 120_000 && !BAD_WORDS.test(t.title)) || tracks[0] || null;
+    }
+  }
+
+  if (fallback && !strict) {
+    console.log(`[SOUNDCLOUD] ⚠ Using fallback: ${fallback.title}`);
+  } else {
+    console.log(`[SOUNDCLOUD] ✗ No good match found for: ${w.title} by ${w.author || 'unknown'}`);
   }
 
   return strict ? null : fallback;
