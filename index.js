@@ -3,7 +3,12 @@ require('dotenv').config();
 const { Client, GatewayIntentBits, EmbedBuilder, MessageFlags } = require('discord.js');
 const { Player, QueueRepeatMode, QueryType } = require('discord-player');
 const { DefaultExtractors } = require('@discord-player/extractor');
-const { YoutubeiExtractor } = require('discord-player-youtubei');
+let YoutubeiExtractor = null;
+try {
+  ({ YoutubeiExtractor } = require('discord-player-youtubei'));
+} catch (e) {
+  console.error('⚠️ discord-player-youtubei could not be loaded, YouTube is disabled:', e.message);
+}
 
 // ───────────── CONFIG ─────────────
 const TOKEN = process.env.DISCORD_TOKEN;
@@ -406,7 +411,7 @@ client.once('clientReady', async () => {
 
   await player.extractors.loadMulti(DefaultExtractors);
   try {
-    await player.extractors.register(YoutubeiExtractor, {});
+    if (YoutubeiExtractor) await player.extractors.register(YoutubeiExtractor, {});
   } catch (e) {
     console.error('⚠️ YouTube extractor failed to load, continuing without it:', e.message);
   }
