@@ -88,6 +88,7 @@ const commands = [
           leaveOnEnd: true,
           leaveOnEndCooldown: 60_000,
           leaveOnStop: true,
+          skipFFmpeg: false,
         },
       };
 
@@ -383,8 +384,10 @@ player.events.on('playerSkip', (queue, track, reason, description) => {
   queue.metadata?.channel?.send(err(`I could not stream **${track.title}** (${reason}).`)).catch(() => {});
 });
 
-player.events.on('debug', (queue, message) => console.log(`[DEBUG ${queue.guild.name}] ${message}`));
-player.on('debug', (message) => console.log(`[DEBUG player] ${message}`));
+if (process.env.DEBUG_PLAYER) {
+  player.events.on('debug', (queue, message) => console.log(`[DEBUG ${queue.guild.name}] ${message}`));
+  player.on('debug', (message) => console.log(`[DEBUG player] ${message}`));
+}
 
 // ───────────── EVENTS ─────────────
 client.once('ready', async () => {
