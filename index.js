@@ -370,6 +370,11 @@ player.events.on('playerError', (queue, error) => {
   queue.metadata?.channel?.send(err('Something went wrong while playing that song, skipping.')).catch(() => {});
 });
 
+player.events.on('playerSkip', (queue, track, reason, description) => {
+  console.log(`Skipped track: ${track.title} | reason: ${reason} | ${description}`);
+  queue.metadata?.channel?.send(err(`I could not stream **${track.title}** (${reason}).`)).catch(() => {});
+});
+
 // ───────────── EVENTS ─────────────
 client.once('ready', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
