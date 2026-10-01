@@ -35,6 +35,21 @@ const client = new Client({
 // without decoding it, so every song "finishes" after ~100ms with no sound. Force ffmpeg to decode every stream.
 const player = new Player(client, { skipFFmpeg: false });
 
+// ───────────── FFMPEG SELF-TEST (shows in Railway logs) ─────────────
+try {
+  const { spawnSync } = require('child_process');
+  const ffPath = require('ffmpeg-static');
+  const prot = spawnSync(ffPath, ['-hide_banner', '-protocols'], { encoding: 'utf8' });
+  const out = String(prot.stdout || '');
+  const dec = spawnSync(ffPath, ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'sine=d=1', '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1']);
+  console.log(
+    `[FFMPEG] path=${ffPath} runs=${prot.status === 0} https=${/\bhttps\b/.test(out)} hls=${/\bhls\b/.test(out)} ` +
+      `decodeTest=${dec.status === 0 ? (dec.stdout?.length || 0) + ' bytes' : 'FAILED ' + String(dec.stderr || '').slice(0, 200)}`
+  );
+} catch (e) {
+  console.error('[FFMPEG] self-test failed:', e.message);
+}
+
 // ───────────── HELPERS ─────────────
 const box = (text) => ({ embeds: [new EmbedBuilder().setColor(COLOR).setDescription(text)] });
 const err = (text) => box(`❌ ${text}`);
@@ -427,9 +442,14 @@ player.events.on('playerSkip', (queue, track, reason, description) => {
   queue.metadata?.channel?.send(err(`I could not stream **${track.title}** (${reason}).`)).catch(() => {});
 });
 
-if (process.env.DEBUG_PLAYER) {
-  player.events.on('debug', (queue, message) => console.log(`[DEBUG ${queue.guild.name}] ${message}`));
-  player.on('debug', (message) => console.log(`[DEBUG player] ${message}`));
+const NOISY = /\[NW\]|AsyncQueue|^from |^to |state change/;
+if (process.env.DEBUG_PLAYER !== '0') {
+  player.events.on('debug', (queue, message) => {
+    if (!NOISY.test(message)) console.log(`[DEBUG queue] ${message}`);
+  });
+  player.on('debug', (message) => {
+    if (!NOISY.test(message)) console.log(`[DEBUG player] ${message}`);
+  });
 }
 
 // ───────────── EVENTS ─────────────
