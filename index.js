@@ -31,7 +31,9 @@ const client = new Client({
   ],
 });
 
-const player = new Player(client);
+// skipFFmpeg defaults to true in discord-player v7, which feeds SoundCloud's mp3/HLS audio straight to Discord
+// without decoding it, so every song "finishes" after ~100ms with no sound. Force ffmpeg to decode every stream.
+const player = new Player(client, { skipFFmpeg: false });
 
 // ───────────── HELPERS ─────────────
 const box = (text) => ({ embeds: [new EmbedBuilder().setColor(COLOR).setDescription(text)] });
@@ -395,7 +397,15 @@ player.events.on('playerStart', (queue, track) => {
   queue.metadata?.channel?.send({ embeds: [embed] }).catch(() => {});
 });
 
-player.events.on('playerFinish', (queue, track) => console.log(`[FINISH] ${track.title} (${track.duration})`));
+const startedAt = new Map();
+player.events.on('playerStart', (queue) => startedAt.set(queue.guild.id, Date.now()));
+player.events.on('playerFinish', (queue, track) => {
+  const elapsed = Date.now() - (startedAt.get(queue.guild.id) || 0);
+  console.log(`[FINISH] ${track.title} (${track.duration}) after ${Math.round(elapsed / 1000)}s`);
+  if (elapsed < 5000 && track.durationMS > 20_000) {
+    queue.metadata?.channel?.send(err('The audio stream ended instantly. Try another song or link.')).catch(() => {});
+  }
+});
 player.events.on('audioTrackAdd', (queue, track) => console.log(`[ADDED] ${track.title} | ${track.duration} | ${track.url}`));
 player.events.on('connection', () => console.log('[VOICE] connected'));
 player.events.on('disconnect', () => console.log('[VOICE] disconnected'));
@@ -417,7 +427,7 @@ player.events.on('playerSkip', (queue, track, reason, description) => {
   queue.metadata?.channel?.send(err(`I could not stream **${track.title}** (${reason}).`)).catch(() => {});
 });
 
-if (process.env.DEBUG_PLAYER !== '0') {
+if (process.env.DEBUG_PLAYER) {
   player.events.on('debug', (queue, message) => console.log(`[DEBUG ${queue.guild.name}] ${message}`));
   player.on('debug', (message) => console.log(`[DEBUG player] ${message}`));
 }
