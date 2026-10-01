@@ -16,6 +16,7 @@
     "mediaplex": "^1.0.0",
     "ffmpeg-static": "^5.2.0",
     "tweetnacl": "^1.0.3",
+    "@snazzah/davey": "latest",
     "dotenv": "^16.4.5"
   }
 }
