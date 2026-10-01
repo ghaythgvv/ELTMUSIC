@@ -1,7 +1,7 @@
 require('dotenv').config();
 
 const { Client, GatewayIntentBits, EmbedBuilder, MessageFlags } = require('discord.js');
-const { Player, QueueRepeatMode } = require('discord-player');
+const { Player, QueueRepeatMode, QueryType } = require('discord-player');
 const { DefaultExtractors } = require('@discord-player/extractor');
 const { YoutubeiExtractor } = require('discord-player-youtubei');
 
@@ -73,29 +73,44 @@ const commands = [
       if (botVc && botVc.id !== vc.id) return ctx.reply(err(`I'm already playing in ${botVc}.`));
 
       await ctx.defer();
+
+      const withTimeout = (p, ms) =>
+        Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]);
+
+      const options = {
+        requestedBy: ctx.user,
+        nodeOptions: {
+          metadata: { channel: ctx.channel },
+          volume: DEFAULT_VOLUME,
+          selfDeaf: true,
+          leaveOnEmpty: true,
+          leaveOnEmptyCooldown: 60_000,
+          leaveOnEnd: true,
+          leaveOnEndCooldown: 60_000,
+          leaveOnStop: true,
+        },
+      };
+
+      let res;
       try {
-        const res = await player.play(vc, query, {
-          requestedBy: ctx.user,
-          nodeOptions: {
-            metadata: { channel: ctx.channel },
-            volume: DEFAULT_VOLUME,
-            selfDeaf: true,
-            leaveOnEmpty: true,
-            leaveOnEmptyCooldown: 60_000,
-            leaveOnEnd: true,
-            leaveOnEndCooldown: 60_000,
-            leaveOnStop: true,
-          },
-        });
-        const playlist = res.searchResult?.playlist;
-        if (playlist) {
-          return ctx.reply(ok(`Queued playlist **${playlist.title}** (${playlist.tracks.length} tracks)`));
-        }
-        return ctx.reply(ok(`Queued [${res.track.title}](${res.track.url})`));
+        res = await withTimeout(player.play(vc, query, options), 25_000);
       } catch (e) {
-        console.error('Play error:', e);
-        return ctx.reply(err('I could not find or play that. Try another name or link.'));
+        console.error('Play error (default search):', e.message);
+        try {
+          res = await withTimeout(player.play(vc, query, { ...options, searchEngine: QueryType.SOUNDCLOUD_SEARCH }), 25_000);
+        } catch (e2) {
+          console.error('Play error (SoundCloud fallback):', e2.message);
+          const q = getQueue(ctx.guild);
+          if (q && !q.currentTrack) q.delete();
+          return ctx.reply(err('I could not find or play that. Try another name or link.'));
+        }
       }
+
+      const playlist = res.searchResult?.playlist;
+      if (playlist) {
+        return ctx.reply(ok(`Queued playlist **${playlist.title}** (${playlist.tracks.length} tracks)`));
+      }
+      return ctx.reply(ok(`Queued [${res.track.title}](${res.track.url})`));
     },
   },
   {
