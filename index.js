@@ -1,5 +1,5 @@
 require('dotenv').config();
-
+ 
 const { Client, GatewayIntentBits, EmbedBuilder, MessageFlags } = require('discord.js');
 const { Readable } = require('stream');
 const { spawn } = require('child_process');
@@ -15,19 +15,19 @@ try {
 } catch (e) {
   console.error('⚠️ discord-player-youtubei could not be loaded, YouTube is disabled:', e.message);
 }
-
+ 
 // ───────────── CONFIG ─────────────
 const TOKEN = process.env.DISCORD_TOKEN;
 const PREFIX = process.env.PREFIX || '!';
 const DEFAULT_VOLUME = Math.min(100, Math.max(1, parseInt(process.env.DEFAULT_VOLUME, 10) || 50));
 const GUILD_ID = process.env.GUILD_ID || '';
 const COLOR = 0x9b59b6; // purple
-
+ 
 if (!TOKEN) {
   console.error('❌ DISCORD_TOKEN is missing. Add it in Railway → your service → Variables.');
   process.exit(1);
 }
-
+ 
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -36,7 +36,7 @@ const client = new Client({
     GatewayIntentBits.MessageContent,
   ],
 });
-
+ 
 // skipFFmpeg defaults to true in discord-player v7, which feeds SoundCloud's mp3/HLS audio straight to Discord
 // without decoding it, so every song "finishes" after ~100ms with no sound. Force ffmpeg to decode every stream.
 const player = new Player(client, {
@@ -46,7 +46,7 @@ const player = new Player(client, {
     highWaterMark: 1 << 25
   }
 });
-
+ 
 // ───────────── FFMPEG SELF-TEST (shows in Railway logs) ─────────────
 try {
   const { spawnSync } = require('child_process');
@@ -61,63 +61,63 @@ try {
 } catch (e) {
   console.error('[FFMPEG] self-test failed:', e.message);
 }
-
+ 
 // ───────────── HELPERS ─────────────
 const box = (text) => ({ embeds: [new EmbedBuilder().setColor(COLOR).setDescription(text)] });
 const err = (text) => box(`❌ ${text}`);
 const ok = (text) => box(`✅ ${text}`);
-
+ 
 const getQueue = (guild) => {
   if (!guild || !guild.id) return null;
   return player.nodes.get(guild.id);
 };
-
+ 
 // Simple logging with memory for debug
 const recentDebug = [];
 const NOISY = /\[NW\]|AsyncQueue|^from |^to |state change/;
-
+ 
 function slog(m) {
   console.log(m);
   remember(m);
 }
-
+ 
 const remember = (m) => {
   if (NOISY.test(m)) return;
   recentDebug.push(String(m).replace(/\s+/g, ' ').slice(0, 220));
   if (recentDebug.length > 40) recentDebug.shift();
 };
-
+ 
 // Reads track names from a Spotify link without needing an API key (used when the extractor returns nothing).
 async function spotifyEmbedTracks(url) {
   const m = String(url).match(/open\.spotify\.com\/(?:intl-[a-z-]+\/)?(playlist|album|track)\/([A-Za-z0-9]+)/i);
   if (!m) return [];
-
+ 
   try {
     const res = await fetch(`https://open.spotify.com/embed/${m[1].toLowerCase()}/${m[2]}`, {
       headers: { 'User-Agent': 'Mozilla/5.0' },
       signal: AbortSignal.timeout(10_000),
     });
-
+ 
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-
+ 
     const html = await res.text();
     const j = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
     if (!j) throw new Error(`no data in embed page (HTTP ${res.status})`);
-
+ 
     const entity = JSON.parse(j[1])?.props?.pageProps?.state?.data?.entity;
     const raw = entity?.trackList?.length
       ? entity.trackList
       : entity?.type === 'track'
         ? [{ title: entity.title || entity.name, subtitle: (entity.artists || []).map((a) => a.name).join(', ') }]
         : [];
-
+ 
     return raw.map((t) => ({ title: t.title, author: t.subtitle, durationMS: Number(t.duration) || 0 })).filter((t) => t.title);
   } catch (e) {
     console.error('[SPOTIFY] spotifyEmbedTracks error:', e.message);
     return [];
   }
 }
-
+ 
 // ───────────── SOUNDCLOUD MATCHING (avoid remixes / previews / wrong songs) ─────────────
 const BAD_WORDS = /\b(remix|slowed|sped ?up|speed ?up|nightcore|cover|live|mashup|bootleg|edit|reverb|8d|bass ?boost(?:ed)?|instrumental|karaoke|acoustic|flip|vip|lofi|rework|remaster|version|but its|but it's|refix|reprise|demo)\b/i;
 const norm = (x) =>
@@ -129,16 +129,16 @@ const norm = (x) =>
     .replace(/[^a-z0-9 ]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
-
+ 
 function scoreTrack(t, want) {
   if (!t || !want) return -Infinity;
-
+ 
   const rt = norm(t.title);
   const ra = norm(t.author);
   const wt = norm(want.title);
   const wa = norm(want.author);
   let score = 0;
-
+ 
   // TITLE MATCHING (max 60 points)
   if (wt && rt === wt) {
     score += 60; // Exact title match
@@ -152,12 +152,12 @@ function scoreTrack(t, want) {
     const hit = tok.filter((x) => rt.includes(x)).length;
     score += tok.length ? Math.round((25 * hit) / tok.length) : 0;
   }
-
+ 
   // ARTIST MATCHING (max 30 points)
   if (wa) {
     const artistTok = wa.split(' ').filter((x) => x.length > 2);
     const combined = `${rt} ${ra}`;
-
+ 
     if (ra === wa) {
       score += 30; // Exact artist match
     } else if (ra.includes(wa) || wa.includes(ra)) {
@@ -167,12 +167,12 @@ function scoreTrack(t, want) {
       score += artistTok.length ? Math.round((20 * artistHit) / artistTok.length) : 0;
     }
   }
-
+ 
   // PENALTY: Don't pick remixes/covers/edits unless that's what was requested
   if (!BAD_WORDS.test(String(want.title)) && BAD_WORDS.test(String(t.title))) {
     score -= 150; // Increased penalty
   }
-
+ 
   // DURATION MATCHING (important for distinguishing originals from remixes)
   if (want.durationMS && want.durationMS > 0) {
     const d = Math.abs((t.durationMS || 0) - want.durationMS);
@@ -181,20 +181,20 @@ function scoreTrack(t, want) {
     else if (d <= 30_000) score += 10;  // Within 30s (acceptable)
     else if (d > 90_000) score -= 50;   // More than 90s off (probably wrong version)
   }
-
+ 
   // PENALTY: 30-120s tracks are usually previews/snippets (unless the original is short)
   if ((t.durationMS || 0) < 120_000 && want.durationMS && want.durationMS >= 120_000) {
     score -= 60;
   }
-
+ 
   // PENALTY: Extremely long tracks (>10min) are usually DJ sets or extended mixes
   if ((t.durationMS || 0) > 600_000 && (!want.durationMS || want.durationMS < 600_000)) {
     score -= 40;
   }
-
+ 
   return score;
 }
-
+ 
 async function searchSoundCloud(query, requestedBy) {
   try {
     const r = await Promise.race([
@@ -207,7 +207,7 @@ async function searchSoundCloud(query, requestedBy) {
     return [];
   }
 }
-
+ 
 // want: a string, or { title, author, durationMS }.  strict=true returns null instead of a weak guess.
 async function findOnSoundCloud(want, requestedBy, { strict = false } = {}) {
   const w = typeof want === 'string' ? { title: want } : want;
@@ -215,57 +215,57 @@ async function findOnSoundCloud(want, requestedBy, { strict = false } = {}) {
   const queries = [...new Set([`${firstArtist} ${w.title}`.trim(), `${w.title} ${w.author || ''}`.trim(), w.title])];
   let fallback = null;
   let allTracks = [];
-
+ 
   for (const q of queries) {
     const tracks = await searchSoundCloud(q, requestedBy);
     if (!tracks.length) continue;
-
+ 
     let best = null;
     let bestScore = -Infinity;
-
+ 
     for (const t of tracks) {
       const sc = scoreTrack(t, w);
       allTracks.push({ track: t, score: sc, query: q });
-
+ 
       if (sc > bestScore) {
         best = t;
         bestScore = sc;
       }
     }
-
+ 
     // Log top 3 matches for debugging
     const sorted = allTracks
       .filter((x) => x.query === q)
       .sort((a, b) => b.score - a.score)
       .slice(0, 3);
-
+ 
     console.log(`[SOUNDCLOUD] Query: "${q}"`);
     sorted.forEach((x, i) => {
       console.log(`  ${i + 1}. [${x.score}pts] ${x.track.title} by ${x.track.author} (${Math.round((x.track.durationMS || 0) / 1000)}s)`);
     });
-
+ 
     // Require higher score in strict mode (60+ points = good match)
     const minScore = strict ? 60 : 30;
     if (best && bestScore >= minScore) {
       console.log(`[SOUNDCLOUD] ✓ Selected: ${best.title} (${bestScore}pts)`);
       return best;
     }
-
+ 
     // Keep fallback for non-strict mode
     if (!fallback && !strict) {
       fallback = tracks.find((t) => t.durationMS >= 120_000 && !BAD_WORDS.test(t.title)) || tracks[0] || null;
     }
   }
-
+ 
   if (fallback && !strict) {
     console.log(`[SOUNDCLOUD] ⚠ Using fallback: ${fallback.title}`);
   } else {
     console.log(`[SOUNDCLOUD] ✗ No good match found for: ${w.title} by ${w.author || 'unknown'}`);
   }
-
+ 
   return strict ? null : fallback;
 }
-
+ 
 // Checks the user is in the same voice channel as the bot. Returns the queue or null (and replies).
 async function requireQueue(ctx, { needPlaying = true } = {}) {
   const vc = ctx.member?.voice?.channel;
@@ -273,22 +273,22 @@ async function requireQueue(ctx, { needPlaying = true } = {}) {
     await ctx.reply(err('Join a voice channel first.'));
     return null;
   }
-
+ 
   const queue = getQueue(ctx.guild);
   if (!queue || (needPlaying && !queue.currentTrack)) {
     await ctx.reply(err('Nothing is playing right now.'));
     return null;
   }
-
+ 
   const botVc = ctx.guild.members.me?.voice?.channel;
   if (botVc && botVc.id !== vc.id) {
     await ctx.reply(err(`You need to be in ${botVc} to use this.`));
     return null;
   }
-
+ 
   return queue;
 }
-
+ 
 // ───────────── COMMANDS ─────────────
 // arg: { name, type: 'string' | 'number', required, description, choices }
 const commands = [
@@ -300,18 +300,18 @@ const commands = [
     async run(ctx, a) {
       const query = String(a.query || '').trim();
       if (!query) return ctx.reply(err(`Give me a song name or link. Example: \`${PREFIX}play lofi hip hop\``));
-
+ 
       const vc = ctx.member?.voice?.channel;
       if (!vc) return ctx.reply(err('Join a voice channel first.'));
-
+ 
       const botVc = ctx.guild.members.me?.voice?.channel;
       if (botVc && botVc.id !== vc.id) return ctx.reply(err(`I'm already playing in ${botVc}.`));
-
+ 
       await ctx.defer();
-
+ 
       const withTimeout = (p, ms) =>
         Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]);
-
+ 
       const options = {
         requestedBy: ctx.user,
         nodeOptions: {
@@ -324,19 +324,9 @@ const commands = [
           leaveOnEndCooldown: 60_000,
           leaveOnStop: true,
           skipFFmpeg: false,
-          // Keep audio processing minimal for best quality
-          ffmpeg: {
-            args: [
-              '-analyzeduration', '0',
-              '-loglevel', '0',
-              '-ar', '48000',
-              '-ac', '2',
-              '-f', 's16le'
-            ]
-          },
         },
       };
-
+ 
       // Spotify links (track / playlist / album): read the track list from Spotify, play each song from SoundCloud.
       if (/open\.spotify\.com|^spotify:/i.test(query)) {
         let found;
@@ -345,15 +335,15 @@ const commands = [
         } catch (e) {
           console.error('Spotify search error:', e.message);
         }
-
+ 
         let list = (found?.tracks?.length ? found.tracks : found?.playlist?.tracks || []).map((t) => ({
           title: t.title,
           author: t.author,
           durationMS: t.durationMS || 0,
         }));
-
+ 
         console.log(`[SPOTIFY] extractor returned ${list.length} tracks`);
-
+ 
         if (!list.length) {
           try {
             list = await spotifyEmbedTracks(query);
@@ -362,14 +352,14 @@ const commands = [
             console.error('[SPOTIFY] embed fallback failed:', e.message);
           }
         }
-
+ 
         list = list.slice(0, 100);
         if (!list.length) return ctx.reply(err('I could not read that Spotify link. Make sure the playlist is public.'));
-
+ 
         const missing = [];
         let started = false;
         let idx = 0;
-
+ 
         for (; idx < list.length && idx < 5 && !started; idx++) {
           try {
             const sc = await findOnSoundCloud(list[idx], ctx.user, { strict: true });
@@ -383,25 +373,25 @@ const commands = [
             console.error('Spotify -> SoundCloud error:', e.message);
           }
         }
-
+ 
         if (!started) {
           const q = getQueue(ctx.guild);
           if (q && !q.currentTrack) q.delete();
           return ctx.reply(err('I could not find those songs on SoundCloud.'));
         }
-
+ 
         const title = found?.playlist?.title;
         await ctx.reply(
           ok(title ? `Loading Spotify playlist **${title}** (${list.length} tracks)…` : `Queued **${list[0].title}**`)
         );
-
+ 
         // Add the rest in the background so the first song starts right away.
         (async () => {
           let added = 0;
           for (; idx < list.length; idx++) {
             const q = getQueue(ctx.guild);
             if (!q) return; // bot was stopped
-
+ 
             try {
               const sc = await findOnSoundCloud(list[idx], ctx.user, { strict: true });
               if (sc) {
@@ -414,22 +404,22 @@ const commands = [
               console.error('Spotify -> SoundCloud error:', e.message);
             }
           }
-
+ 
           const skipped = missing.length
             ? `\n\n⚠️ Not found on SoundCloud (${missing.length}): ${missing.slice(0, 10).join(' • ')}${missing.length > 10 ? ' …' : ''}`
             : '';
-
+ 
           ctx.channel?.send(ok(`Spotify playlist loaded: **${added + 1}** songs queued.${skipped}`)).catch(() => {});
         })();
-
+ 
         return;
       }
-
+ 
       // Links use the default (auto-detect) engine.
       // Plain text searches try SoundCloud first (YouTube is often blocked/broken), then fall back to the default engine.
       const isUrl = /^https?:\/\//i.test(query);
       const attempts = [];
-
+ 
       if (!isUrl) {
         // Search SoundCloud and pick the best match (no previews / remixes unless asked for).
         try {
@@ -439,9 +429,9 @@ const commands = [
           console.error('SoundCloud search error:', e.message);
         }
       }
-
+ 
       attempts.push({ label: 'default', target: query, opts: options });
-
+ 
       let res;
       for (const { label, target, opts } of attempts) {
         try {
@@ -451,18 +441,18 @@ const commands = [
           console.error(`Play error (${label} search):`, e.message);
         }
       }
-
+ 
       if (!res) {
         const q = getQueue(ctx.guild);
         if (q && !q.currentTrack) q.delete();
         return ctx.reply(err('I could not find or play that. Try another name or link.'));
       }
-
+ 
       const playlist = res.searchResult?.playlist;
       if (playlist) {
         return ctx.reply(ok(`Queued playlist **${playlist.title}** (${playlist.tracks.length} tracks)`));
       }
-
+ 
       return ctx.reply(ok(`Queued [${res.track.title}](${res.track.url})`));
     },
   },
@@ -473,7 +463,7 @@ const commands = [
     async run(ctx) {
       const queue = await requireQueue(ctx);
       if (!queue) return;
-
+ 
       const title = queue.currentTrack?.title || 'song';
       queue.node.skip();
       return ctx.reply(ok(`Skipped **${title}**`));
@@ -486,7 +476,7 @@ const commands = [
     async run(ctx) {
       const queue = await requireQueue(ctx, { needPlaying: false });
       if (!queue) return;
-
+ 
       queue.delete();
       return ctx.reply(ok('Stopped the music and left the channel.'));
     },
@@ -497,9 +487,9 @@ const commands = [
     async run(ctx) {
       const queue = await requireQueue(ctx);
       if (!queue) return;
-
+ 
       if (queue.node.isPaused()) return ctx.reply(err('Already paused.'));
-
+ 
       queue.node.setPaused(true);
       return ctx.reply(ok('Paused.'));
     },
@@ -511,9 +501,9 @@ const commands = [
     async run(ctx) {
       const queue = await requireQueue(ctx);
       if (!queue) return;
-
+ 
       if (!queue.node.isPaused()) return ctx.reply(err('The music is not paused.'));
-
+ 
       queue.node.setPaused(false);
       return ctx.reply(ok('Resumed.'));
     },
@@ -525,16 +515,16 @@ const commands = [
     async run(ctx) {
       const queue = getQueue(ctx.guild);
       if (!queue?.currentTrack) return ctx.reply(err('Nothing is playing right now.'));
-
+ 
       const t = queue.currentTrack;
       const embed = new EmbedBuilder()
         .setColor(COLOR)
         .setTitle('Now Playing')
         .setDescription(`[${t.title}](${t.url})\nby **${t.author}**\n\n${queue.node.createProgressBar()}`)
         .setFooter({ text: `Requested by ${t.requestedBy?.username || 'unknown'}` });
-
+ 
       if (t.thumbnail) embed.setThumbnail(t.thumbnail);
-
+ 
       return ctx.reply({ embeds: [embed] });
     },
   },
@@ -545,11 +535,11 @@ const commands = [
     async run(ctx) {
       const queue = getQueue(ctx.guild);
       if (!queue?.currentTrack) return ctx.reply(err('The queue is empty.'));
-
+ 
       const tracks = queue.tracks.toArray();
       const lines = tracks.slice(0, 10).map((t, i) => `\`${i + 1}.\` [${t.title}](${t.url}) • ${t.duration}`);
       const more = tracks.length > 10 ? `\n…and **${tracks.length - 10}** more` : '';
-
+ 
       const embed = new EmbedBuilder()
         .setColor(COLOR)
         .setTitle('Queue')
@@ -557,7 +547,7 @@ const commands = [
           `**Now playing:** [${queue.currentTrack.title}](${queue.currentTrack.url})\n\n` +
             (lines.length ? lines.join('\n') + more : 'No songs up next.')
         );
-
+ 
       return ctx.reply({ embeds: [embed] });
     },
   },
@@ -569,13 +559,13 @@ const commands = [
     async run(ctx, a) {
       const queue = await requireQueue(ctx);
       if (!queue) return;
-
+ 
       if (a.amount === undefined || a.amount === null || Number.isNaN(a.amount)) {
         return ctx.reply(box(`🔊 Current volume: **${queue.node.volume}%**`));
       }
-
+ 
       if (a.amount < 1 || a.amount > 100) return ctx.reply(err('Volume must be between 1 and 100.'));
-
+ 
       queue.node.setVolume(a.amount);
       return ctx.reply(ok(`Volume set to **${a.amount}%**`));
     },
@@ -594,17 +584,17 @@ const commands = [
     async run(ctx, a) {
       const queue = await requireQueue(ctx);
       if (!queue) return;
-
+ 
       const modes = {
         off: QueueRepeatMode.OFF,
         track: QueueRepeatMode.TRACK,
         queue: QueueRepeatMode.QUEUE,
         autoplay: QueueRepeatMode.AUTOPLAY,
       };
-
+ 
       const mode = String(a.mode || '').toLowerCase();
       if (!(mode in modes)) return ctx.reply(err('Use: `off`, `track`, `queue` or `autoplay`.'));
-
+ 
       queue.setRepeatMode(modes[mode]);
       return ctx.reply(ok(`Loop mode: **${mode}**`));
     },
@@ -615,9 +605,9 @@ const commands = [
     async run(ctx) {
       const queue = await requireQueue(ctx);
       if (!queue) return;
-
+ 
       if (queue.tracks.size < 2) return ctx.reply(err('Not enough songs in the queue to shuffle.'));
-
+ 
       queue.tracks.shuffle();
       return ctx.reply(ok('Queue shuffled.'));
     },
@@ -629,10 +619,10 @@ const commands = [
     async run(ctx, a) {
       const queue = await requireQueue(ctx);
       if (!queue) return;
-
+ 
       const pos = a.position;
       if (!pos || pos < 1 || pos > queue.tracks.size) return ctx.reply(err('That position is not in the queue.'));
-
+ 
       const removed = queue.removeTrack(pos - 1);
       return ctx.reply(ok(`Removed **${removed?.title || 'song'}**`));
     },
@@ -644,10 +634,10 @@ const commands = [
     async run(ctx, a) {
       const queue = await requireQueue(ctx);
       if (!queue) return;
-
+ 
       const pos = a.position;
       if (!pos || pos < 1 || pos > queue.tracks.size) return ctx.reply(err('That position is not in the queue.'));
-
+ 
       queue.node.skipTo(pos - 1);
       return ctx.reply(ok(`Skipped to song **#${pos}**`));
     },
@@ -659,11 +649,11 @@ const commands = [
     async run(ctx, a) {
       const queue = await requireQueue(ctx);
       if (!queue) return;
-
+ 
       if (a.seconds === undefined || Number.isNaN(a.seconds) || a.seconds < 0) {
         return ctx.reply(err('Give me a time in seconds.'));
       }
-
+ 
       try {
         await queue.node.seek(a.seconds * 1000);
         return ctx.reply(ok(`Jumped to **${a.seconds}s**`));
@@ -679,7 +669,7 @@ const commands = [
     async run(ctx) {
       const queue = await requireQueue(ctx);
       if (!queue) return;
-
+ 
       queue.tracks.clear();
       return ctx.reply(ok('Queue cleared.'));
     },
@@ -700,23 +690,23 @@ const commands = [
       const list = commands
         .map((c) => `\`${PREFIX}${c.name}\` or \`/${c.name}\` — ${c.description}`)
         .join('\n');
-
+ 
       const embed = new EmbedBuilder()
         .setColor(COLOR)
         .setTitle('Music Commands')
         .setDescription(list);
-
+ 
       return ctx.reply({ embeds: [embed] });
     },
   },
 ];
-
+ 
 const byName = new Map();
 for (const c of commands) {
   byName.set(c.name, c);
   for (const al of c.aliases || []) byName.set(al, c);
 }
-
+ 
 // ───────────── CONTEXT WRAPPERS (same command code for slash + prefix) ─────────────
 function slashCtx(i) {
   return {
@@ -728,7 +718,7 @@ function slashCtx(i) {
     reply: (p) => (i.deferred || i.replied ? i.editReply(p).catch(() => {}) : i.reply(p).catch(() => {})),
   };
 }
-
+ 
 function prefixCtx(m) {
   return {
     user: m.author,
@@ -744,36 +734,39 @@ function prefixCtx(m) {
     },
   };
 }
-
+ 
 // ───────────── PLAYER EVENTS ─────────────
 const startedAt = new Map();
-
+ 
 player.events.on('playerStart', (queue, track) => {
   startedAt.set(queue.guild.id, Date.now());
-
+ 
   const embed = new EmbedBuilder()
     .setColor(COLOR)
     .setTitle('Now Playing')
     .setDescription(`[${track.title}](${track.url})\nby **${track.author}** • ${track.duration}`)
     .setFooter({ text: `Requested by ${track.requestedBy?.username || 'unknown'}` });
-
+ 
   if (track.thumbnail) embed.setThumbnail(track.thumbnail);
-
+ 
   queue.metadata?.channel?.send({ embeds: [embed] }).catch(() => {});
 });
-
+ 
 player.events.on('playerFinish', (queue, track) => {
   const elapsed = Date.now() - (startedAt.get(queue.guild.id) || 0);
   console.log(`[FINISH] ${track.title} (${track.duration}) after ${Math.round(elapsed / 1000)}s`);
-
-  // Only send error message if song finished TOO quickly (< 3s) and it's a long song
-  // This prevents spam when songs legitimately finish
+ 
+  // Only log error if song finished TOO quickly (< 3s) and it's a long song
   if (elapsed < 3000 && track.durationMS > 20_000) {
     console.error(`[ERROR] Track finished instantly: ${track.title} (expected ${track.duration})`);
-    // Don't spam Discord - just log it
+    console.error(`[ERROR] Possible causes:`);
+    console.error(`  - FFmpeg is not working correctly`);
+    console.error(`  - Audio stream format is incompatible`);
+    console.error(`  - Missing audio encoding dependencies (opusscript)`);
+    console.error(`[ERROR] Check that opusscript and libsodium-wrappers are installed`);
   }
 });
-
+ 
 player.events.on('willPlayTrack', (queue, track, config, resolve) => {
   const d = config.dispatcherConfig;
   d.disableEqualizer = true;
@@ -782,57 +775,58 @@ player.events.on('willPlayTrack', (queue, track, config, resolve) => {
   d.disableFilters = true;
   resolve();
 });
-
+ 
 player.events.on('audioTrackAdd', (queue, track) => {
   console.log(`[ADDED] ${track.title} | ${track.duration} | ${track.url}`);
 });
-
+ 
 player.events.on('connection', () => console.log('[VOICE] connected'));
 player.events.on('disconnect', () => console.log('[VOICE] disconnected'));
-
+ 
 player.events.on('emptyQueue', (queue) => {
   queue.metadata?.channel?.send(box('The queue has finished. Add more songs with `' + PREFIX + 'play`.')).catch(() => {});
 });
-
+ 
 player.events.on('error', (queue, error) => {
   console.error('[PLAYER] Queue error:', error);
 });
-
+ 
 player.events.on('playerError', (queue, error) => {
   console.error('[PLAYER] Player error:', error);
   queue.metadata?.channel
     ?.send(err(`Playback error: \`${String(error?.message || error).slice(0, 300)}\``))
     .catch(() => {});
 });
-
+ 
 player.events.on('playerSkip', (queue, track, reason, description) => {
   console.log(`[PLAYER] Skipped track: ${track.title} | reason: ${reason} | ${description}`);
   queue.metadata?.channel?.send(err(`I could not stream **${track.title}** (${reason}).`)).catch(() => {});
 });
-
+ 
 if (process.env.DEBUG_PLAYER !== '0') {
   player.events.on('debug', (queue, message) => {
     remember(message);
     if (!NOISY.test(message)) console.log(`[DEBUG queue] ${message}`);
   });
-
+ 
   player.on('debug', (message) => {
     remember(message);
     if (!NOISY.test(message)) console.log(`[DEBUG player] ${message}`);
   });
 }
-
+ 
 // ───────────── CLIENT EVENTS ─────────────
 client.once('ready', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
-
+ 
+  // Load extractors for discord-player v6
   try {
-    await player.extractors.loadMulti(DefaultExtractors);
+    await player.extractors.loadDefault();
     console.log('✅ Default extractors loaded.');
   } catch (e) {
     console.error('⚠️ Default extractors failed to load:', e.message);
   }
-
+ 
   try {
     if (YoutubeiExtractor) {
       await player.extractors.register(YoutubeiExtractor, {});
@@ -841,10 +835,10 @@ client.once('ready', async () => {
   } catch (e) {
     console.error('⚠️ YouTube extractor failed to load, continuing without it:', e.message);
   }
-
+ 
   console.log('✅ Extractors loaded.');
   console.log(player.scanDeps());
-
+ 
   const body = commands.map((c) => ({
     name: c.name,
     description: c.description,
@@ -860,7 +854,7 @@ client.once('ready', async () => {
         ]
       : [],
   }));
-
+ 
   try {
     if (GUILD_ID) {
       const guild = await client.guilds.fetch(GUILD_ID);
@@ -873,27 +867,27 @@ client.once('ready', async () => {
   } catch (e) {
     console.error('❌ Could not register slash commands:', e.message);
   }
-
+ 
   client.user.setPresence({
     activities: [{ name: `${PREFIX}help | /help` }],
     status: 'online'
   });
 });
-
+ 
 client.on('interactionCreate', async (i) => {
   if (!i.isChatInputCommand() || !i.guild) return;
-
+ 
   const cmd = byName.get(i.commandName);
   if (!cmd) return;
-
+ 
   const args = cmd.arg ? { [cmd.arg.name]: i.options.get(cmd.arg.name)?.value } : {};
-
+ 
   try {
     await cmd.run(slashCtx(i), args);
   } catch (e) {
     console.error('[INTERACTION] Slash command error:', e);
     const msg = { ...err('Something went wrong.'), flags: MessageFlags.Ephemeral };
-
+ 
     try {
       if (i.deferred || i.replied) {
         await i.followUp(msg);
@@ -905,20 +899,20 @@ client.on('interactionCreate', async (i) => {
     }
   }
 });
-
+ 
 client.on('messageCreate', async (m) => {
   if (m.author.bot || !m.guild || !m.content.startsWith(PREFIX)) return;
-
+ 
   const [name, ...rest] = m.content.slice(PREFIX.length).trim().split(/\s+/);
   const cmd = byName.get((name || '').toLowerCase());
   if (!cmd) return;
-
+ 
   const text = rest.join(' ').trim();
   let args = {};
   if (cmd.arg) {
     args[cmd.arg.name] = cmd.arg.type === 'number' ? (text ? Number(text) : undefined) : text;
   }
-
+ 
   try {
     await cmd.run(prefixCtx(m), args);
   } catch (e) {
@@ -926,19 +920,20 @@ client.on('messageCreate', async (m) => {
     m.reply(err('Something went wrong.')).catch(() => {});
   }
 });
-
+ 
 client.on('error', (e) => console.error('[CLIENT] Client error:', e));
-
+ 
 process.on('unhandledRejection', (e) => {
   console.error('[PROCESS] Unhandled rejection:', e);
 });
-
+ 
 process.on('uncaughtException', (e) => {
   console.error('[PROCESS] Uncaught exception:', e);
   process.exit(1);
 });
-
+ 
 client.login(TOKEN).catch((e) => {
   console.error(`❌ Login failed: ${e.message}. The token is wrong or was reset — paste the NEW token in Railway Variables.`);
   process.exit(1);
 });
+ 
