@@ -2,6 +2,11 @@ require('dotenv').config();
 
 const { Client, GatewayIntentBits, EmbedBuilder, MessageFlags } = require('discord.js');
 const { Readable } = require('stream');
+const { spawn } = require('child_process');
+let ffmpegPath = null;
+try {
+  ffmpegPath = require('ffmpeg-static');
+} catch {}
 const { Player, QueueRepeatMode, QueryType } = require('discord-player');
 const { DefaultExtractors } = require('@discord-player/extractor');
 let YoutubeiExtractor = null;
@@ -58,6 +63,11 @@ const ok = (text) => box(`✅ ${text}`);
 
 const getQueue = (guild) => player.nodes.get(guild.id);
 
+function slog(m) {
+  console.log(m);
+  remember(m);
+}
+
 // Reads track names from a Spotify link without needing an API key (used when the extractor returns nothing).
 async function spotifyEmbedTracks(url) {
   const m = String(url).match(/open\.spotify\.com\/(?:intl-[a-z-]+\/)?(playlist|album|track)\/([A-Za-z0-9]+)/i);
@@ -75,16 +85,78 @@ async function spotifyEmbedTracks(url) {
     : entity?.type === 'track'
       ? [{ title: entity.title || entity.name, subtitle: (entity.artists || []).map((a) => a.name).join(', ') }]
       : [];
-  return raw.map((t) => ({ title: t.title, author: t.subtitle })).filter((t) => t.title);
+  return raw.map((t) => ({ title: t.title, author: t.subtitle, durationMS: Number(t.duration) || 0 })).filter((t) => t.title);
 }
 
-// Finds a track on SoundCloud (prefers full-length uploads over 30-90s label previews).
-async function findOnSoundCloud(query, requestedBy) {
+// ───────────── SOUNDCLOUD MATCHING (avoid remixes / previews / wrong songs) ─────────────
+const BAD_WORDS = /\b(remix|slowed|sped ?up|speed ?up|nightcore|cover|live|mashup|bootleg|edit|reverb|8d|bass ?boost(?:ed)?|instrumental|karaoke|acoustic|flip|vip|lofi)\b/i;
+const norm = (x) =>
+  String(x || '')
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\(.*?\)|\[.*?\]/g, ' ')
+    .replace(/[^a-z0-9 ]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+function scoreTrack(t, want) {
+  const rt = norm(t.title);
+  const wt = norm(want.title);
+  let score = 0;
+  if (wt && rt.includes(wt)) score += 50;
+  else {
+    const tok = wt.split(' ').filter(Boolean);
+    const hit = tok.filter((x) => rt.includes(x)).length;
+    score += tok.length ? Math.round((30 * hit) / tok.length) : 0;
+  }
+  const artistTok = norm(want.author).split(' ').filter((x) => x.length > 2);
+  if (artistTok.length && artistTok.some((x) => `${rt} ${norm(t.author)}`.includes(x))) score += 20;
+  // Don't pick remixes/slowed/etc. unless that is what was asked for.
+  if (!BAD_WORDS.test(String(want.title)) && BAD_WORDS.test(String(t.title))) score -= 100;
+  if (want.durationMS) {
+    const d = Math.abs((t.durationMS || 0) - want.durationMS);
+    score += d <= 10_000 ? 40 : d <= 25_000 ? 20 : d > 60_000 ? -20 : 0;
+  }
+  // 30-90s label previews
+  if ((t.durationMS || 0) < 100_000 && !(want.durationMS && want.durationMS < 100_000)) score -= 40;
+  return score;
+}
+
+async function searchSoundCloud(query, requestedBy) {
   const r = await Promise.race([
     player.search(query, { requestedBy, searchEngine: QueryType.SOUNDCLOUD_SEARCH }),
     new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 15_000)),
   ]);
-  return r.tracks.find((t) => t.durationMS >= 120_000) || r.tracks[0] || null;
+  return r.tracks;
+}
+
+// want: a string, or { title, author, durationMS }.  strict=true returns null instead of a weak guess.
+async function findOnSoundCloud(want, requestedBy, { strict = false } = {}) {
+  const w = typeof want === 'string' ? { title: want } : want;
+  const firstArtist = String(w.author || '').split(/,|&| feat\.? | x /i)[0].trim();
+  const queries = [...new Set([`${firstArtist} ${w.title}`.trim(), `${w.title} ${w.author || ''}`.trim(), w.title])];
+  let fallback = null;
+  for (const q of queries) {
+    let tracks;
+    try {
+      tracks = await searchSoundCloud(q, requestedBy);
+    } catch {
+      continue;
+    }
+    let best = null;
+    let bestScore = -Infinity;
+    for (const t of tracks) {
+      const sc = scoreTrack(t, w);
+      if (sc > bestScore) {
+        best = t;
+        bestScore = sc;
+      }
+    }
+    if (best && bestScore >= 30) return best;
+    if (!fallback) fallback = tracks.find((t) => t.durationMS >= 120_000) || tracks[0] || null;
+  }
+  return strict ? null : fallback;
 }
 
 // Checks the user is in the same voice channel as the bot. Returns the queue or null (and replies).
@@ -149,19 +221,36 @@ const commands = [
           // Fetch the SoundCloud audio ourselves (plain mp3 over https) and let ffmpeg decode it.
           // Returning null falls back to discord-player's default stream.
           onBeforeCreateStream: async (track) => {
+            if (!/soundcloud\.com/i.test(track.url)) return null;
+            const sc = player.extractors.get('com.discord-player.soundcloudextractor');
+
+            // 1) Plain mp3 download
             try {
-              if (!/soundcloud\.com/i.test(track.url)) return null;
-              const sc = player.extractors.get('com.discord-player.soundcloudextractor');
               const link = await sc.internal.util.streamLink(track.url, 'progressive');
               if (!link) throw new Error('no progressive link');
               const res = await fetch(link, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-              console.log(`[STREAM] ${track.title} | HTTP ${res.status} | ${res.headers.get('content-type')}`);
               if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+              slog(`[STREAM] ${track.title} | progressive mp3 | ${res.headers.get('content-type')}`);
               return Readable.fromWeb(res.body);
             } catch (e) {
-              console.error('[STREAM] custom SoundCloud stream failed, using default:', e.message);
-              return null;
+              slog(`[STREAM] ${track.title} | progressive failed: ${e.message} -> trying HLS`);
             }
+
+            // 2) HLS playlist: our own ffmpeg copies the audio (no re-encode) and hands it on
+            try {
+              if (!ffmpegPath) throw new Error('ffmpeg-static missing');
+              const link = await sc.internal.util.streamLink(track.url, 'hls');
+              if (!link) throw new Error('no hls link');
+              const ff = spawn(ffmpegPath, ['-hide_banner', '-loglevel', 'error', '-user_agent', 'Mozilla/5.0', '-i', link, '-vn', '-c:a', 'copy', '-f', 'mpegts', 'pipe:1']);
+              ff.stderr.on('data', (d) => slog(`[STREAM][hls] ${String(d).trim().slice(0, 200)}`));
+              ff.on('error', (e) => slog(`[STREAM][hls] spawn error: ${e.message}`));
+              ff.stdout.on('close', () => ff.kill('SIGKILL'));
+              slog(`[STREAM] ${track.title} | HLS via ffmpeg`);
+              return ff.stdout;
+            } catch (e) {
+              slog(`[STREAM] ${track.title} | HLS failed: ${e.message} -> default stream`);
+            }
+            return null;
           },
         },
       };
@@ -177,6 +266,7 @@ const commands = [
         let list = (found?.tracks?.length ? found.tracks : found?.playlist?.tracks || []).map((t) => ({
           title: t.title,
           author: t.author,
+          durationMS: t.durationMS || 0,
         }));
         console.log(`[SPOTIFY] extractor returned ${list.length} tracks`);
         if (!list.length) {
@@ -190,13 +280,16 @@ const commands = [
         list = list.slice(0, 100);
         if (!list.length) return ctx.reply(err('I could not read that Spotify link. Make sure the playlist is public.'));
 
-        const toQuery = (t) => `${t.title} ${t.author || ''}`.trim();
+        const missing = [];
         let started = false;
         let idx = 0;
         for (; idx < list.length && idx < 5 && !started; idx++) {
           try {
-            const sc = await findOnSoundCloud(toQuery(list[idx]), ctx.user);
-            if (!sc) continue;
+            const sc = await findOnSoundCloud(list[idx], ctx.user, { strict: true });
+            if (!sc) {
+              missing.push(`${list[idx].title} - ${list[idx].author || ''}`.trim());
+              continue;
+            }
             await withTimeout(player.play(vc, sc, options), 25_000);
             started = true;
           } catch (e) {
@@ -221,16 +314,21 @@ const commands = [
             const q = getQueue(ctx.guild);
             if (!q) return; // bot was stopped
             try {
-              const sc = await findOnSoundCloud(toQuery(list[idx]), ctx.user);
+              const sc = await findOnSoundCloud(list[idx], ctx.user, { strict: true });
               if (sc) {
                 q.addTrack(sc);
                 added++;
+              } else {
+                missing.push(`${list[idx].title} - ${list[idx].author || ''}`.trim());
               }
             } catch (e) {
               console.error('Spotify -> SoundCloud error:', e.message);
             }
           }
-          ctx.channel?.send(ok(`Spotify playlist loaded: **${added + 1}** songs queued.`)).catch(() => {});
+          const skipped = missing.length
+            ? `\n\n⚠️ Not found on SoundCloud (${missing.length}): ${missing.slice(0, 10).join(' • ')}${missing.length > 10 ? ' …' : ''}`
+            : '';
+          ctx.channel?.send(ok(`Spotify playlist loaded: **${added + 1}** songs queued.${skipped}`)).catch(() => {});
         })();
         return;
       }
@@ -241,14 +339,10 @@ const commands = [
       const attempts = [];
 
       if (!isUrl) {
-        // Search SoundCloud and prefer a full-length upload over a 30-90s label preview.
+        // Search SoundCloud and pick the best match (no previews / remixes unless asked for).
         try {
-          const found = await withTimeout(
-            player.search(query, { requestedBy: ctx.user, searchEngine: QueryType.SOUNDCLOUD_SEARCH }),
-            15_000
-          );
-          const full = found.tracks.find((t) => t.durationMS >= 120_000) || found.tracks[0];
-          if (full) attempts.push({ label: 'SoundCloud', target: full, opts: options });
+          const best = await withTimeout(findOnSoundCloud(query, ctx.user), 40_000);
+          if (best) attempts.push({ label: 'SoundCloud', target: best, opts: options });
         } catch (e) {
           console.error('SoundCloud search error:', e.message);
         }
