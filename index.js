@@ -124,7 +124,7 @@ const norm = (x) =>
   String(x || '')
     .toLowerCase()
     .normalize('NFKD')
-    .replace(/[̀-ͯ]/g, '')
+    .replace(/[\u0300-\u036f]/g, '')
     .replace(/\(.*?\)|\[.*?\]/g, ' ')
     .replace(/[^a-z0-9 ]/g, ' ')
     .replace(/\s+/g, ' ')
@@ -189,6 +189,11 @@ function scoreTrack(t, want) {
  
   // PENALTY: Extremely long tracks (>10min) are usually DJ sets or extended mixes
   if ((t.durationMS || 0) > 600_000 && (!want.durationMS || want.durationMS < 600_000)) {
+    score -= 40;
+  }
+ 
+  // No known duration (plain-text search): prefer full-length tracks over 30-90s previews
+  if (!want.durationMS && (t.durationMS || 0) < 120_000) {
     score -= 40;
   }
  
@@ -936,4 +941,3 @@ client.login(TOKEN).catch((e) => {
   console.error(`❌ Login failed: ${e.message}. The token is wrong or was reset — paste the NEW token in Railway Variables.`);
   process.exit(1);
 });
- 
