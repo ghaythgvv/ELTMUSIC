@@ -39,7 +39,13 @@ const client = new Client({
 
 // skipFFmpeg defaults to true in discord-player v7, which feeds SoundCloud's mp3/HLS audio straight to Discord
 // without decoding it, so every song "finishes" after ~100ms with no sound. Force ffmpeg to decode every stream.
-const player = new Player(client, { skipFFmpeg: false });
+const player = new Player(client, {
+  skipFFmpeg: false,
+  ytdlOptions: {
+    quality: 'highestaudio',
+    highWaterMark: 1 << 25
+  }
+});
 
 // ───────────── FFMPEG SELF-TEST (shows in Railway logs) ─────────────
 try {
@@ -318,10 +324,16 @@ const commands = [
           leaveOnEndCooldown: 60_000,
           leaveOnStop: true,
           skipFFmpeg: false,
-          disableEqualizer: true,
-          disableBiquad: true,
-          disableResampler: true,
-          disableFilterer: true,
+          // Keep audio processing minimal for best quality
+          ffmpeg: {
+            args: [
+              '-analyzeduration', '0',
+              '-loglevel', '0',
+              '-ar', '48000',
+              '-ac', '2',
+              '-f', 's16le'
+            ]
+          },
         },
       };
 
