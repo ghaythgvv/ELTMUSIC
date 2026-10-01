@@ -385,6 +385,7 @@ client.once('ready', async () => {
   await player.extractors.loadMulti(DefaultExtractors);
   await player.extractors.register(YoutubeiExtractor, {});
   console.log('✅ Extractors loaded.');
+  console.log(player.scanDeps());
 
   const body = commands.map((c) => ({
     name: c.name,
