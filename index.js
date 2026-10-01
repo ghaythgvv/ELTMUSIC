@@ -1,6 +1,7 @@
 require('dotenv').config();
 
 const { Client, GatewayIntentBits, EmbedBuilder, MessageFlags } = require('discord.js');
+const { Readable } = require('stream');
 const { Player, QueueRepeatMode, QueryType } = require('discord-player');
 const { DefaultExtractors } = require('@discord-player/extractor');
 let YoutubeiExtractor = null;
@@ -111,6 +112,23 @@ const commands = [
           leaveOnEndCooldown: 60_000,
           leaveOnStop: true,
           skipFFmpeg: false,
+          // Fetch the SoundCloud audio ourselves (plain mp3 over https) and let ffmpeg decode it.
+          // Returning null falls back to discord-player's default stream.
+          onBeforeCreateStream: async (track) => {
+            try {
+              if (!/soundcloud\.com/i.test(track.url)) return null;
+              const sc = player.extractors.get('com.discord-player.soundcloudextractor');
+              const link = await sc.internal.util.streamLink(track.url, 'progressive');
+              if (!link) throw new Error('no progressive link');
+              const res = await fetch(link, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+              console.log(`[STREAM] ${track.title} | HTTP ${res.status} | ${res.headers.get('content-type')}`);
+              if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+              return Readable.fromWeb(res.body);
+            } catch (e) {
+              console.error('[STREAM] custom SoundCloud stream failed, using default:', e.message);
+              return null;
+            }
+          },
         },
       };
 
@@ -418,7 +436,13 @@ player.events.on('playerFinish', (queue, track) => {
   const elapsed = Date.now() - (startedAt.get(queue.guild.id) || 0);
   console.log(`[FINISH] ${track.title} (${track.duration}) after ${Math.round(elapsed / 1000)}s`);
   if (elapsed < 5000 && track.durationMS > 20_000) {
-    queue.metadata?.channel?.send(err('The audio stream ended instantly. Try another song or link.')).catch(() => {});
+    const dump = recentDebug.slice(-14).join('\n').slice(-1500);
+    queue.metadata?.channel
+      ?.send({
+        ...err('The audio stream ended instantly. Debug info below:'),
+        content: '```\n' + dump + '\n```',
+      })
+      .catch(() => {});
   }
 });
 player.events.on('audioTrackAdd', (queue, track) => console.log(`[ADDED] ${track.title} | ${track.duration} | ${track.url}`));
@@ -442,12 +466,20 @@ player.events.on('playerSkip', (queue, track, reason, description) => {
   queue.metadata?.channel?.send(err(`I could not stream **${track.title}** (${reason}).`)).catch(() => {});
 });
 
+const recentDebug = [];
+const remember = (m) => {
+  if (NOISY.test(m)) return;
+  recentDebug.push(String(m).replace(/\s+/g, ' ').slice(0, 220));
+  if (recentDebug.length > 40) recentDebug.shift();
+};
 const NOISY = /\[NW\]|AsyncQueue|^from |^to |state change/;
 if (process.env.DEBUG_PLAYER !== '0') {
   player.events.on('debug', (queue, message) => {
+    remember(message);
     if (!NOISY.test(message)) console.log(`[DEBUG queue] ${message}`);
   });
   player.on('debug', (message) => {
+    remember(message);
     if (!NOISY.test(message)) console.log(`[DEBUG player] ${message}`);
   });
 }
