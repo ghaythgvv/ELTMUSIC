@@ -58,6 +58,26 @@ const ok = (text) => box(`✅ ${text}`);
 
 const getQueue = (guild) => player.nodes.get(guild.id);
 
+// Reads track names from a Spotify link without needing an API key (used when the extractor returns nothing).
+async function spotifyEmbedTracks(url) {
+  const m = String(url).match(/open\.spotify\.com\/(?:intl-[a-z-]+\/)?(playlist|album|track)\/([A-Za-z0-9]+)/i);
+  if (!m) return [];
+  const res = await fetch(`https://open.spotify.com/embed/${m[1].toLowerCase()}/${m[2]}`, {
+    headers: { 'User-Agent': 'Mozilla/5.0' },
+    signal: AbortSignal.timeout(10_000),
+  });
+  const html = await res.text();
+  const j = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+  if (!j) throw new Error(`no data in embed page (HTTP ${res.status})`);
+  const entity = JSON.parse(j[1])?.props?.pageProps?.state?.data?.entity;
+  const raw = entity?.trackList?.length
+    ? entity.trackList
+    : entity?.type === 'track'
+      ? [{ title: entity.title || entity.name, subtitle: (entity.artists || []).map((a) => a.name).join(', ') }]
+      : [];
+  return raw.map((t) => ({ title: t.title, author: t.subtitle })).filter((t) => t.title);
+}
+
 // Finds a track on SoundCloud (prefers full-length uploads over 30-90s label previews).
 async function findOnSoundCloud(query, requestedBy) {
   const r = await Promise.race([
@@ -154,7 +174,20 @@ const commands = [
         } catch (e) {
           console.error('Spotify search error:', e.message);
         }
-        const list = (found?.tracks || []).slice(0, 100);
+        let list = (found?.tracks?.length ? found.tracks : found?.playlist?.tracks || []).map((t) => ({
+          title: t.title,
+          author: t.author,
+        }));
+        console.log(`[SPOTIFY] extractor returned ${list.length} tracks`);
+        if (!list.length) {
+          try {
+            list = await spotifyEmbedTracks(query);
+            console.log(`[SPOTIFY] embed fallback returned ${list.length} tracks`);
+          } catch (e) {
+            console.error('[SPOTIFY] embed fallback failed:', e.message);
+          }
+        }
+        list = list.slice(0, 100);
         if (!list.length) return ctx.reply(err('I could not read that Spotify link. Make sure the playlist is public.'));
 
         const toQuery = (t) => `${t.title} ${t.author || ''}`.trim();
@@ -176,7 +209,7 @@ const commands = [
           return ctx.reply(err('I could not find those songs on SoundCloud.'));
         }
 
-        const title = found.playlist?.title;
+        const title = found?.playlist?.title;
         await ctx.reply(
           ok(title ? `Loading Spotify playlist **${title}** (${list.length} tracks)…` : `Queued **${list[0].title}**`)
         );
@@ -484,7 +517,9 @@ function prefixCtx(m) {
     defer: () => m.channel.sendTyping().catch(() => {}),
     reply: (p) => {
       const payload = typeof p === 'string' ? { content: p } : p;
-      return m.reply({ ...payload, allowedMentions: { repliedUser: false } });
+      return m
+        .reply({ ...payload, allowedMentions: { repliedUser: false } })
+        .catch(() => m.channel.send({ ...payload, allowedMentions: { parse: [] } }));
     },
   };
 }
@@ -514,6 +549,14 @@ player.events.on('playerFinish', (queue, track) => {
       })
       .catch(() => {});
   }
+});
+player.events.on('willPlayTrack', (queue, track, config, resolve) => {
+  const d = config.dispatcherConfig;
+  d.disableEqualizer = true;
+  d.disableBiquad = true;
+  d.disableResampler = true;
+  d.disableFilters = true;
+  resolve();
 });
 player.events.on('audioTrackAdd', (queue, track) => console.log(`[ADDED] ${track.title} | ${track.duration} | ${track.url}`));
 player.events.on('connection', () => console.log('[VOICE] connected'));
