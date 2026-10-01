@@ -100,17 +100,27 @@ const commands = [
       // Links use the default (auto-detect) engine.
       // Plain text searches try SoundCloud first (YouTube is often blocked/broken), then fall back to the default engine.
       const isUrl = /^https?:\/\//i.test(query);
-      const attempts = isUrl
-        ? [{ label: 'default', opts: options }]
-        : [
-            { label: 'SoundCloud', opts: { ...options, searchEngine: QueryType.SOUNDCLOUD_SEARCH } },
-            { label: 'default', opts: options },
-          ];
+      const attempts = [];
+
+      if (!isUrl) {
+        // Search SoundCloud and prefer a full-length upload over a 30-90s label preview.
+        try {
+          const found = await withTimeout(
+            player.search(query, { requestedBy: ctx.user, searchEngine: QueryType.SOUNDCLOUD_SEARCH }),
+            15_000
+          );
+          const full = found.tracks.find((t) => t.durationMS >= 120_000) || found.tracks[0];
+          if (full) attempts.push({ label: 'SoundCloud', target: full, opts: options });
+        } catch (e) {
+          console.error('SoundCloud search error:', e.message);
+        }
+      }
+      attempts.push({ label: 'default', target: query, opts: options });
 
       let res;
-      for (const { label, opts } of attempts) {
+      for (const { label, target, opts } of attempts) {
         try {
-          res = await withTimeout(player.play(vc, query, opts), 25_000);
+          res = await withTimeout(player.play(vc, target, opts), 25_000);
           break;
         } catch (e) {
           console.error(`Play error (${label} search):`, e.message);
@@ -392,7 +402,9 @@ player.events.on('emptyQueue', (queue) => {
 player.events.on('error', (queue, error) => console.error('Queue error:', error));
 player.events.on('playerError', (queue, error) => {
   console.error('Player error:', error);
-  queue.metadata?.channel?.send(err('Something went wrong while playing that song, skipping.')).catch(() => {});
+  queue.metadata?.channel
+    ?.send(err(`Playback error: \`${String(error?.message || error).slice(0, 300)}\``))
+    .catch(() => {});
 });
 
 player.events.on('playerSkip', (queue, track, reason, description) => {
