@@ -58,6 +58,15 @@ const ok = (text) => box(`✅ ${text}`);
 
 const getQueue = (guild) => player.nodes.get(guild.id);
 
+// Finds a track on SoundCloud (prefers full-length uploads over 30-90s label previews).
+async function findOnSoundCloud(query, requestedBy) {
+  const r = await Promise.race([
+    player.search(query, { requestedBy, searchEngine: QueryType.SOUNDCLOUD_SEARCH }),
+    new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 15_000)),
+  ]);
+  return r.tracks.find((t) => t.durationMS >= 120_000) || r.tracks[0] || null;
+}
+
 // Checks the user is in the same voice channel as the bot. Returns the queue or null (and replies).
 async function requireQueue(ctx, { needPlaying = true } = {}) {
   const vc = ctx.member.voice.channel;
@@ -112,6 +121,11 @@ const commands = [
           leaveOnEndCooldown: 60_000,
           leaveOnStop: true,
           skipFFmpeg: false,
+          // Extra JS audio processing adds CPU load and can make the sound choppy/muddy. Keep only volume.
+          disableEqualizer: true,
+          disableBiquad: true,
+          disableResampler: true,
+          disableFilterer: true,
           // Fetch the SoundCloud audio ourselves (plain mp3 over https) and let ffmpeg decode it.
           // Returning null falls back to discord-player's default stream.
           onBeforeCreateStream: async (track) => {
@@ -131,6 +145,62 @@ const commands = [
           },
         },
       };
+
+      // Spotify links (track / playlist / album): read the track list from Spotify, play each song from SoundCloud.
+      if (/open\.spotify\.com|^spotify:/i.test(query)) {
+        let found;
+        try {
+          found = await withTimeout(player.search(query, { requestedBy: ctx.user }), 25_000);
+        } catch (e) {
+          console.error('Spotify search error:', e.message);
+        }
+        const list = (found?.tracks || []).slice(0, 100);
+        if (!list.length) return ctx.reply(err('I could not read that Spotify link. Make sure the playlist is public.'));
+
+        const toQuery = (t) => `${t.title} ${t.author || ''}`.trim();
+        let started = false;
+        let idx = 0;
+        for (; idx < list.length && idx < 5 && !started; idx++) {
+          try {
+            const sc = await findOnSoundCloud(toQuery(list[idx]), ctx.user);
+            if (!sc) continue;
+            await withTimeout(player.play(vc, sc, options), 25_000);
+            started = true;
+          } catch (e) {
+            console.error('Spotify -> SoundCloud error:', e.message);
+          }
+        }
+        if (!started) {
+          const q = getQueue(ctx.guild);
+          if (q && !q.currentTrack) q.delete();
+          return ctx.reply(err('I could not find those songs on SoundCloud.'));
+        }
+
+        const title = found.playlist?.title;
+        await ctx.reply(
+          ok(title ? `Loading Spotify playlist **${title}** (${list.length} tracks)…` : `Queued **${list[0].title}**`)
+        );
+
+        // Add the rest in the background so the first song starts right away.
+        (async () => {
+          let added = 0;
+          for (; idx < list.length; idx++) {
+            const q = getQueue(ctx.guild);
+            if (!q) return; // bot was stopped
+            try {
+              const sc = await findOnSoundCloud(toQuery(list[idx]), ctx.user);
+              if (sc) {
+                q.addTrack(sc);
+                added++;
+              }
+            } catch (e) {
+              console.error('Spotify -> SoundCloud error:', e.message);
+            }
+          }
+          ctx.channel?.send(ok(`Spotify playlist loaded: **${added + 1}** songs queued.`)).catch(() => {});
+        })();
+        return;
+      }
 
       // Links use the default (auto-detect) engine.
       // Plain text searches try SoundCloud first (YouTube is often blocked/broken), then fall back to the default engine.
