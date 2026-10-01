@@ -92,19 +92,30 @@ const commands = [
         },
       };
 
+      // Links use the default (auto-detect) engine.
+      // Plain text searches try SoundCloud first (YouTube is often blocked/broken), then fall back to the default engine.
+      const isUrl = /^https?:\/\//i.test(query);
+      const attempts = isUrl
+        ? [{ label: 'default', opts: options }]
+        : [
+            { label: 'SoundCloud', opts: { ...options, searchEngine: QueryType.SOUNDCLOUD_SEARCH } },
+            { label: 'default', opts: options },
+          ];
+
       let res;
-      try {
-        res = await withTimeout(player.play(vc, query, options), 25_000);
-      } catch (e) {
-        console.error('Play error (default search):', e.message);
+      for (const { label, opts } of attempts) {
         try {
-          res = await withTimeout(player.play(vc, query, { ...options, searchEngine: QueryType.SOUNDCLOUD_SEARCH }), 25_000);
-        } catch (e2) {
-          console.error('Play error (SoundCloud fallback):', e2.message);
-          const q = getQueue(ctx.guild);
-          if (q && !q.currentTrack) q.delete();
-          return ctx.reply(err('I could not find or play that. Try another name or link.'));
+          res = await withTimeout(player.play(vc, query, opts), 25_000);
+          break;
+        } catch (e) {
+          console.error(`Play error (${label} search):`, e.message);
         }
+      }
+
+      if (!res) {
+        const q = getQueue(ctx.guild);
+        if (q && !q.currentTrack) q.delete();
+        return ctx.reply(err('I could not find or play that. Try another name or link.'));
       }
 
       const playlist = res.searchResult?.playlist;
@@ -390,11 +401,15 @@ if (process.env.DEBUG_PLAYER) {
 }
 
 // ───────────── EVENTS ─────────────
-client.once('ready', async () => {
+client.once('clientReady', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
 
   await player.extractors.loadMulti(DefaultExtractors);
-  await player.extractors.register(YoutubeiExtractor, {});
+  try {
+    await player.extractors.register(YoutubeiExtractor, {});
+  } catch (e) {
+    console.error('⚠️ YouTube extractor failed to load, continuing without it:', e.message);
+  }
   console.log('✅ Extractors loaded.');
   console.log(player.scanDeps());
 
