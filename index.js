@@ -1,33 +1,81 @@
 require('dotenv').config();
- 
-const { Client, GatewayIntentBits, EmbedBuilder, MessageFlags } = require('discord.js');
-const { Readable } = require('stream');
-const { spawn } = require('child_process');
-let ffmpegPath = null;
-try {
-  ffmpegPath = require('ffmpeg-static');
-} catch {}
-const { Player, QueueRepeatMode, QueryType } = require('discord-player');
+
+const {
+  Client,
+  GatewayIntentBits,
+  EmbedBuilder,
+  MessageFlags,
+} = require('discord.js');
+
+const { spawnSync } = require('child_process');
+
+const {
+  Player,
+  QueueRepeatMode,
+  QueryType,
+} = require('discord-player');
+
 const { DefaultExtractors } = require('@discord-player/extractor');
+
 let YoutubeiExtractor = null;
+
 try {
   ({ YoutubeiExtractor } = require('discord-player-youtubei'));
 } catch (e) {
-  console.error('⚠️ discord-player-youtubei could not be loaded, YouTube is disabled:', e.message);
+  console.error(
+    '⚠️ discord-player-youtubei could not be loaded. YouTubei disabled:',
+    e.message
+  );
 }
- 
-// ───────────── CONFIG ─────────────
+
+let ffmpegPath = null;
+
+try {
+  ffmpegPath = require('ffmpeg-static');
+} catch (e) {
+  console.error('⚠️ ffmpeg-static could not be loaded:', e.message);
+}
+
+// ─────────────────────────────────────────────
+// CONFIG
+// ─────────────────────────────────────────────
+
 const TOKEN = process.env.DISCORD_TOKEN;
 const PREFIX = process.env.PREFIX || '!';
-const DEFAULT_VOLUME = Math.min(100, Math.max(1, parseInt(process.env.DEFAULT_VOLUME, 10) || 50));
+
+const DEFAULT_VOLUME = Math.min(
+  100,
+  Math.max(1, parseInt(process.env.DEFAULT_VOLUME, 10) || 50)
+);
+
 const GUILD_ID = process.env.GUILD_ID || '';
-const COLOR = 0x9b59b6; // purple
- 
+
+const COLOR = 0x9b59b6;
+
 if (!TOKEN) {
-  console.error('❌ DISCORD_TOKEN is missing. Add it in Railway → your service → Variables.');
+  console.error(
+    '❌ DISCORD_TOKEN is missing. Add it in Railway → Variables.'
+  );
   process.exit(1);
 }
- 
+
+// ─────────────────────────────────────────────
+// FFMPEG
+// ─────────────────────────────────────────────
+
+if (ffmpegPath) {
+  process.env.FFMPEG_PATH = ffmpegPath;
+  console.log(`🎬 FFmpeg path: ${ffmpegPath}`);
+} else {
+  console.warn(
+    '⚠️ ffmpeg-static is unavailable. Discord Player will try to find system FFmpeg.'
+  );
+}
+
+// ─────────────────────────────────────────────
+// DISCORD CLIENT
+// ─────────────────────────────────────────────
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -36,92 +84,237 @@ const client = new Client({
     GatewayIntentBits.MessageContent,
   ],
 });
- 
-// skipFFmpeg defaults to true in discord-player v7, which feeds SoundCloud's mp3/HLS audio straight to Discord
-// without decoding it, so every song "finishes" after ~100ms with no sound. Force ffmpeg to decode every stream.
-const player = new Player(client, {
+
+// ─────────────────────────────────────────────
+// DISCORD PLAYER
+// ─────────────────────────────────────────────
+
+const playerOptions = {
   skipFFmpeg: false,
-  ytdlOptions: {
-    quality: 'highestaudio',
-    highWaterMark: 1 << 25
+
+  connectionTimeout: 30_000,
+
+  lagMonitor: 10_000,
+
+  ...(ffmpegPath ? { ffmpegPath } : {}),
+};
+
+const player = new Player(client, playerOptions);
+
+// ─────────────────────────────────────────────
+// FFMPEG SELF TEST
+// ─────────────────────────────────────────────
+
+function testFFmpeg() {
+  if (!ffmpegPath) {
+    console.warn('⚠️ FFmpeg self-test skipped.');
+    return;
   }
-});
- 
-// ───────────── FFMPEG SELF-TEST (shows in Railway logs) ─────────────
-try {
-  const { spawnSync } = require('child_process');
-  const ffPath = require('ffmpeg-static');
-  const prot = spawnSync(ffPath, ['-hide_banner', '-protocols'], { encoding: 'utf8' });
-  const out = String(prot.stdout || '');
-  const dec = spawnSync(ffPath, ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'sine=d=1', '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1']);
-  console.log(
-    `[FFMPEG] path=${ffPath} runs=${prot.status === 0} https=${/\bhttps\b/.test(out)} hls=${/\bhls\b/.test(out)} ` +
-      `decodeTest=${dec.status === 0 ? (dec.stdout?.length || 0) + ' bytes' : 'FAILED ' + String(dec.stderr || '').slice(0, 200)}`
-  );
-} catch (e) {
-  console.error('[FFMPEG] self-test failed:', e.message);
-}
- 
-// ───────────── HELPERS ─────────────
-const box = (text) => ({ embeds: [new EmbedBuilder().setColor(COLOR).setDescription(text)] });
-const err = (text) => box(`❌ ${text}`);
-const ok = (text) => box(`✅ ${text}`);
- 
-const getQueue = (guild) => {
-  if (!guild || !guild.id) return null;
-  return player.nodes.get(guild.id);
-};
- 
-// Simple logging with memory for debug
-const recentDebug = [];
-const NOISY = /\[NW\]|AsyncQueue|^from |^to |state change/;
- 
-function slog(m) {
-  console.log(m);
-  remember(m);
-}
- 
-const remember = (m) => {
-  if (NOISY.test(m)) return;
-  recentDebug.push(String(m).replace(/\s+/g, ' ').slice(0, 220));
-  if (recentDebug.length > 40) recentDebug.shift();
-};
- 
-// Reads track names from a Spotify link without needing an API key (used when the extractor returns nothing).
-async function spotifyEmbedTracks(url) {
-  const m = String(url).match(/open\.spotify\.com\/(?:intl-[a-z-]+\/)?(playlist|album|track)\/([A-Za-z0-9]+)/i);
-  if (!m) return [];
- 
+
   try {
-    const res = await fetch(`https://open.spotify.com/embed/${m[1].toLowerCase()}/${m[2]}`, {
-      headers: { 'User-Agent': 'Mozilla/5.0' },
-      signal: AbortSignal.timeout(10_000),
-    });
- 
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
- 
-    const html = await res.text();
-    const j = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
-    if (!j) throw new Error(`no data in embed page (HTTP ${res.status})`);
- 
-    const entity = JSON.parse(j[1])?.props?.pageProps?.state?.data?.entity;
+    const version = spawnSync(
+      ffmpegPath,
+      ['-hide_banner', '-version'],
+      {
+        encoding: 'utf8',
+        timeout: 15_000,
+      }
+    );
+
+    console.log(
+      `[FFMPEG] executable=${version.status === 0 ? 'OK' : 'FAILED'}`
+    );
+
+    const protocols = spawnSync(
+      ffmpegPath,
+      ['-hide_banner', '-protocols'],
+      {
+        encoding: 'utf8',
+        timeout: 15_000,
+      }
+    );
+
+    const output = String(protocols.stdout || '');
+
+    console.log(
+      `[FFMPEG] https=${/\bhttps\b/.test(output)} hls=${/\bhls\b/.test(
+        output
+      )}`
+    );
+
+    const decodeTest = spawnSync(
+      ffmpegPath,
+      [
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-f',
+        'lavfi',
+        '-i',
+        'sine=d=1',
+        '-f',
+        's16le',
+        '-ar',
+        '48000',
+        '-ac',
+        '2',
+        'pipe:1',
+      ],
+      {
+        timeout: 15_000,
+      }
+    );
+
+    console.log(
+      `[FFMPEG] decodeTest=${
+        decodeTest.status === 0
+          ? `${decodeTest.stdout?.length || 0} bytes`
+          : `FAILED ${String(decodeTest.stderr || '').slice(0, 300)}`
+      }`
+    );
+  } catch (e) {
+    console.error('[FFMPEG] self-test failed:', e.message);
+  }
+}
+
+testFFmpeg();
+
+// ─────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────
+
+const box = (text) => ({
+  embeds: [
+    new EmbedBuilder()
+      .setColor(COLOR)
+      .setDescription(text),
+  ],
+});
+
+const err = (text) =>
+  box(`❌ ${text}`);
+
+const ok = (text) =>
+  box(`✅ ${text}`);
+
+function getQueue(guild) {
+  if (!guild?.id) return null;
+
+  return player.nodes.get(guild.id);
+}
+
+// ─────────────────────────────────────────────
+// DEBUG MEMORY
+// ─────────────────────────────────────────────
+
+const recentDebug = [];
+
+const NOISY =
+  /\[NW\]|AsyncQueue|^from |^to |state change/;
+
+function remember(message) {
+  if (NOISY.test(String(message))) return;
+
+  recentDebug.push(
+    String(message)
+      .replace(/\s+/g, ' ')
+      .slice(0, 220)
+  );
+
+  if (recentDebug.length > 50) {
+    recentDebug.shift();
+  }
+}
+
+function slog(message) {
+  console.log(message);
+  remember(message);
+}
+
+// ─────────────────────────────────────────────
+// SPOTIFY EMBED FALLBACK
+// ─────────────────────────────────────────────
+
+async function spotifyEmbedTracks(url) {
+  const match = String(url).match(
+    /open\.spotify\.com\/(?:intl-[a-z-]+\/)?(playlist|album|track)\/([A-Za-z0-9]+)/i
+  );
+
+  if (!match) {
+    return [];
+  }
+
+  try {
+    const response = await fetch(
+      `https://open.spotify.com/embed/${match[1].toLowerCase()}/${match[2]}`,
+      {
+        headers: {
+          'User-Agent': 'Mozilla/5.0',
+        },
+        signal: AbortSignal.timeout(10_000),
+      }
+    );
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const html = await response.text();
+
+    const dataMatch = html.match(
+      /<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/
+    );
+
+    if (!dataMatch) {
+      throw new Error(
+        `No Spotify data found (HTTP ${response.status})`
+      );
+    }
+
+    const data = JSON.parse(dataMatch[1]);
+
+    const entity =
+      data?.props?.pageProps?.state?.data?.entity;
+
     const raw = entity?.trackList?.length
       ? entity.trackList
       : entity?.type === 'track'
-        ? [{ title: entity.title || entity.name, subtitle: (entity.artists || []).map((a) => a.name).join(', ') }]
+        ? [
+            {
+              title: entity.title || entity.name,
+              subtitle: (entity.artists || [])
+                .map((artist) => artist.name)
+                .join(', '),
+            },
+          ]
         : [];
- 
-    return raw.map((t) => ({ title: t.title, author: t.subtitle, durationMS: Number(t.duration) || 0 })).filter((t) => t.title);
+
+    return raw
+      .map((track) => ({
+        title: track.title,
+        author: track.subtitle,
+        durationMS: Number(track.duration) || 0,
+      }))
+      .filter((track) => track.title);
   } catch (e) {
-    console.error('[SPOTIFY] spotifyEmbedTracks error:', e.message);
+    console.error(
+      '[SPOTIFY] spotifyEmbedTracks error:',
+      e.message
+    );
+
     return [];
   }
 }
- 
-// ───────────── SOUNDCLOUD MATCHING (avoid remixes / previews / wrong songs) ─────────────
-const BAD_WORDS = /\b(remix|slowed|sped ?up|speed ?up|nightcore|cover|live|mashup|bootleg|edit|reverb|8d|bass ?boost(?:ed)?|instrumental|karaoke|acoustic|flip|vip|lofi|rework|remaster|version|but its|but it's|refix|reprise|demo)\b/i;
-const norm = (x) =>
-  String(x || '')
+
+// ─────────────────────────────────────────────
+// SOUNDCLOUD MATCHING
+// ─────────────────────────────────────────────
+
+const BAD_WORDS =
+  /\b(remix|slowed|sped ?up|speed ?up|nightcore|cover|live|mashup|bootleg|edit|reverb|8d|bass ?boost(?:ed)?|instrumental|karaoke|acoustic|flip|vip|lofi|rework|remaster|version|but its|but it's|refix|reprise|demo)\b/i;
+
+function norm(value) {
+  return String(value || '')
     .toLowerCase()
     .normalize('NFKD')
     .replace(/[\u0300-\u036f]/g, '')
@@ -129,815 +322,2080 @@ const norm = (x) =>
     .replace(/[^a-z0-9 ]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
- 
-function scoreTrack(t, want) {
-  if (!t || !want) return -Infinity;
- 
-  const rt = norm(t.title);
-  const ra = norm(t.author);
-  const wt = norm(want.title);
-  const wa = norm(want.author);
-  let score = 0;
- 
-  // TITLE MATCHING (max 60 points)
-  if (wt && rt === wt) {
-    score += 60; // Exact title match
-  } else if (wt && rt.includes(wt)) {
-    score += 45; // Title is contained
-  } else if (wt && wt.includes(rt) && rt.length > 4) {
-    score += 35; // Reversed containment (SoundCloud title is subset)
-  } else {
-    // Word-by-word matching
-    const tok = wt.split(' ').filter(Boolean);
-    const hit = tok.filter((x) => rt.includes(x)).length;
-    score += tok.length ? Math.round((25 * hit) / tok.length) : 0;
+}
+
+function scoreTrack(track, wanted) {
+  if (!track || !wanted) {
+    return -Infinity;
   }
- 
-  // ARTIST MATCHING (max 30 points)
-  if (wa) {
-    const artistTok = wa.split(' ').filter((x) => x.length > 2);
-    const combined = `${rt} ${ra}`;
- 
-    if (ra === wa) {
-      score += 30; // Exact artist match
-    } else if (ra.includes(wa) || wa.includes(ra)) {
-      score += 25; // Artist name contained
-    } else if (artistTok.length) {
-      const artistHit = artistTok.filter((x) => combined.includes(x)).length;
-      score += artistTok.length ? Math.round((20 * artistHit) / artistTok.length) : 0;
+
+  const trackTitle = norm(track.title);
+  const trackAuthor = norm(track.author);
+
+  const wantedTitle = norm(wanted.title);
+  const wantedAuthor = norm(wanted.author);
+
+  let score = 0;
+
+  // TITLE
+  if (wantedTitle && trackTitle === wantedTitle) {
+    score += 60;
+  } else if (
+    wantedTitle &&
+    trackTitle.includes(wantedTitle)
+  ) {
+    score += 45;
+  } else if (
+    wantedTitle &&
+    wantedTitle.includes(trackTitle) &&
+    trackTitle.length > 4
+  ) {
+    score += 35;
+  } else {
+    const words = wantedTitle
+      .split(' ')
+      .filter(Boolean);
+
+    const hits = words.filter((word) =>
+      trackTitle.includes(word)
+    ).length;
+
+    score += words.length
+      ? Math.round((25 * hits) / words.length)
+      : 0;
+  }
+
+  // ARTIST
+  if (wantedAuthor) {
+    const artistWords = wantedAuthor
+      .split(' ')
+      .filter((word) => word.length > 2);
+
+    const combined = `${trackTitle} ${trackAuthor}`;
+
+    if (trackAuthor === wantedAuthor) {
+      score += 30;
+    } else if (
+      trackAuthor.includes(wantedAuthor) ||
+      wantedAuthor.includes(trackAuthor)
+    ) {
+      score += 25;
+    } else if (artistWords.length) {
+      const hits = artistWords.filter((word) =>
+        combined.includes(word)
+      ).length;
+
+      score += Math.round(
+        (20 * hits) / artistWords.length
+      );
     }
   }
- 
-  // PENALTY: Don't pick remixes/covers/edits unless that's what was requested
-  if (!BAD_WORDS.test(String(want.title)) && BAD_WORDS.test(String(t.title))) {
-    score -= 150; // Increased penalty
+
+  // WRONG VERSION PENALTY
+  if (
+    !BAD_WORDS.test(String(wanted.title)) &&
+    BAD_WORDS.test(String(track.title))
+  ) {
+    score -= 150;
   }
- 
-  // DURATION MATCHING (important for distinguishing originals from remixes)
-  if (want.durationMS && want.durationMS > 0) {
-    const d = Math.abs((t.durationMS || 0) - want.durationMS);
-    if (d <= 5_000) score += 50;        // Within 5s (very close)
-    else if (d <= 15_000) score += 30;  // Within 15s (close)
-    else if (d <= 30_000) score += 10;  // Within 30s (acceptable)
-    else if (d > 90_000) score -= 50;   // More than 90s off (probably wrong version)
+
+  // DURATION
+  if (wanted.durationMS && wanted.durationMS > 0) {
+    const difference = Math.abs(
+      (track.durationMS || 0) - wanted.durationMS
+    );
+
+    if (difference <= 5_000) {
+      score += 50;
+    } else if (difference <= 15_000) {
+      score += 30;
+    } else if (difference <= 30_000) {
+      score += 10;
+    } else if (difference > 90_000) {
+      score -= 50;
+    }
   }
- 
-  // PENALTY: 30-120s tracks are usually previews/snippets (unless the original is short)
-  if ((t.durationMS || 0) < 120_000 && want.durationMS && want.durationMS >= 120_000) {
+
+  // SHORT PREVIEW PENALTY
+  if (
+    (track.durationMS || 0) < 120_000 &&
+    wanted.durationMS &&
+    wanted.durationMS >= 120_000
+  ) {
     score -= 60;
   }
- 
-  // PENALTY: Extremely long tracks (>10min) are usually DJ sets or extended mixes
-  if ((t.durationMS || 0) > 600_000 && (!want.durationMS || want.durationMS < 600_000)) {
+
+  // EXTREMELY LONG TRACK PENALTY
+  if (
+    (track.durationMS || 0) > 600_000 &&
+    (!wanted.durationMS ||
+      wanted.durationMS < 600_000)
+  ) {
     score -= 40;
   }
- 
-  // No known duration (plain-text search): prefer full-length tracks over 30-90s previews
-  if (!want.durationMS && (t.durationMS || 0) < 120_000) {
+
+  // UNKNOWN DURATION
+  if (
+    !wanted.durationMS &&
+    (track.durationMS || 0) < 120_000
+  ) {
     score -= 40;
   }
- 
+
   return score;
 }
- 
+
 async function searchSoundCloud(query, requestedBy) {
   try {
-    const r = await Promise.race([
-      player.search(query, { requestedBy, searchEngine: QueryType.SOUNDCLOUD_SEARCH }),
-      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 15_000)),
+    const result = await Promise.race([
+      player.search(query, {
+        requestedBy,
+        searchEngine: QueryType.SOUNDCLOUD_SEARCH,
+      }),
+
+      new Promise((_, reject) =>
+        setTimeout(
+          () => reject(new Error('SoundCloud search timeout')),
+          15_000
+        )
+      ),
     ]);
-    return r.tracks || [];
+
+    return result?.tracks || [];
   } catch (e) {
-    console.error('[SOUNDCLOUD] searchSoundCloud error:', e.message);
+    console.error(
+      '[SOUNDCLOUD] Search error:',
+      e.message
+    );
+
     return [];
   }
 }
- 
-// want: a string, or { title, author, durationMS }.  strict=true returns null instead of a weak guess.
-async function findOnSoundCloud(want, requestedBy, { strict = false } = {}) {
-  const w = typeof want === 'string' ? { title: want } : want;
-  const firstArtist = String(w.author || '').split(/,|&| feat\.? | x /i)[0].trim();
-  const queries = [...new Set([`${firstArtist} ${w.title}`.trim(), `${w.title} ${w.author || ''}`.trim(), w.title])];
+
+async function findOnSoundCloud(
+  wanted,
+  requestedBy,
+  { strict = false } = {}
+) {
+  const searchData =
+    typeof wanted === 'string'
+      ? { title: wanted }
+      : wanted;
+
+  const firstArtist = String(
+    searchData.author || ''
+  )
+    .split(/,|&| feat\.? | x /i)[0]
+    .trim();
+
+  const queries = [
+    `${firstArtist} ${searchData.title}`.trim(),
+    `${searchData.title} ${searchData.author || ''}`.trim(),
+    searchData.title,
+  ];
+
+  const uniqueQueries = [
+    ...new Set(queries.filter(Boolean)),
+  ];
+
   let fallback = null;
-  let allTracks = [];
- 
-  for (const q of queries) {
-    const tracks = await searchSoundCloud(q, requestedBy);
-    if (!tracks.length) continue;
- 
+  const allTracks = [];
+
+  for (const query of uniqueQueries) {
+    const tracks = await searchSoundCloud(
+      query,
+      requestedBy
+    );
+
+    if (!tracks.length) {
+      continue;
+    }
+
     let best = null;
     let bestScore = -Infinity;
- 
-    for (const t of tracks) {
-      const sc = scoreTrack(t, w);
-      allTracks.push({ track: t, score: sc, query: q });
- 
-      if (sc > bestScore) {
-        best = t;
-        bestScore = sc;
+
+    for (const track of tracks) {
+      const score = scoreTrack(
+        track,
+        searchData
+      );
+
+      allTracks.push({
+        track,
+        score,
+        query,
+      });
+
+      if (score > bestScore) {
+        best = track;
+        bestScore = score;
       }
     }
- 
-    // Log top 3 matches for debugging
+
     const sorted = allTracks
-      .filter((x) => x.query === q)
+      .filter((item) => item.query === query)
       .sort((a, b) => b.score - a.score)
       .slice(0, 3);
- 
-    console.log(`[SOUNDCLOUD] Query: "${q}"`);
-    sorted.forEach((x, i) => {
-      console.log(`  ${i + 1}. [${x.score}pts] ${x.track.title} by ${x.track.author} (${Math.round((x.track.durationMS || 0) / 1000)}s)`);
+
+    console.log(
+      `[SOUNDCLOUD] Query: "${query}"`
+    );
+
+    sorted.forEach((item, index) => {
+      console.log(
+        `  ${index + 1}. [${item.score}pts] ${item.track.title} by ${item.track.author} (${Math.round(
+          (item.track.durationMS || 0) / 1000
+        )}s)`
+      );
     });
- 
-    // Require higher score in strict mode (60+ points = good match)
-    const minScore = strict ? 60 : 30;
-    if (best && bestScore >= minScore) {
-      console.log(`[SOUNDCLOUD] ✓ Selected: ${best.title} (${bestScore}pts)`);
+
+    const minimumScore = strict ? 60 : 30;
+
+    if (
+      best &&
+      bestScore >= minimumScore
+    ) {
+      console.log(
+        `[SOUNDCLOUD] ✓ Selected: ${best.title} (${bestScore}pts)`
+      );
+
       return best;
     }
- 
-    // Keep fallback for non-strict mode
+
     if (!fallback && !strict) {
-      fallback = tracks.find((t) => t.durationMS >= 120_000 && !BAD_WORDS.test(t.title)) || tracks[0] || null;
+      fallback =
+        tracks.find(
+          (track) =>
+            track.durationMS >= 120_000 &&
+            !BAD_WORDS.test(track.title)
+        ) ||
+        tracks[0] ||
+        null;
     }
   }
- 
+
   if (fallback && !strict) {
-    console.log(`[SOUNDCLOUD] ⚠ Using fallback: ${fallback.title}`);
+    console.log(
+      `[SOUNDCLOUD] ⚠ Using fallback: ${fallback.title}`
+    );
   } else {
-    console.log(`[SOUNDCLOUD] ✗ No good match found for: ${w.title} by ${w.author || 'unknown'}`);
+    console.log(
+      `[SOUNDCLOUD] ✗ No good match found for: ${searchData.title} by ${searchData.author || 'unknown'}`
+    );
   }
- 
+
   return strict ? null : fallback;
 }
- 
-// Checks the user is in the same voice channel as the bot. Returns the queue or null (and replies).
-async function requireQueue(ctx, { needPlaying = true } = {}) {
-  const vc = ctx.member?.voice?.channel;
-  if (!vc) {
-    await ctx.reply(err('Join a voice channel first.'));
+
+// ─────────────────────────────────────────────
+// QUEUE CHECK
+// ─────────────────────────────────────────────
+
+async function requireQueue(
+  ctx,
+  { needPlaying = true } = {}
+) {
+  const voiceChannel =
+    ctx.member?.voice?.channel;
+
+  if (!voiceChannel) {
+    await ctx.reply(
+      err('Join a voice channel first.')
+    );
+
     return null;
   }
- 
+
   const queue = getQueue(ctx.guild);
-  if (!queue || (needPlaying && !queue.currentTrack)) {
-    await ctx.reply(err('Nothing is playing right now.'));
+
+  if (
+    !queue ||
+    (needPlaying && !queue.currentTrack)
+  ) {
+    await ctx.reply(
+      err('Nothing is playing right now.')
+    );
+
     return null;
   }
- 
-  const botVc = ctx.guild.members.me?.voice?.channel;
-  if (botVc && botVc.id !== vc.id) {
-    await ctx.reply(err(`You need to be in ${botVc} to use this.`));
+
+  const botVoiceChannel =
+    ctx.guild.members.me?.voice?.channel;
+
+  if (
+    botVoiceChannel &&
+    botVoiceChannel.id !== voiceChannel.id
+  ) {
+    await ctx.reply(
+      err(
+        `You need to be in ${botVoiceChannel} to use this.`
+      )
+    );
+
     return null;
   }
- 
+
   return queue;
 }
- 
-// ───────────── COMMANDS ─────────────
-// arg: { name, type: 'string' | 'number', required, description, choices }
+
+// ─────────────────────────────────────────────
+// COMMANDS
+// ─────────────────────────────────────────────
+
 const commands = [
   {
     name: 'play',
     aliases: ['p'],
     description: 'Play a song or playlist (name or link)',
-    arg: { name: 'query', type: 'string', required: true, description: 'Song name or link' },
-    async run(ctx, a) {
-      const query = String(a.query || '').trim();
-      if (!query) return ctx.reply(err(`Give me a song name or link. Example: \`${PREFIX}play lofi hip hop\``));
- 
-      const vc = ctx.member?.voice?.channel;
-      if (!vc) return ctx.reply(err('Join a voice channel first.'));
- 
-      const botVc = ctx.guild.members.me?.voice?.channel;
-      if (botVc && botVc.id !== vc.id) return ctx.reply(err(`I'm already playing in ${botVc}.`));
- 
+
+    arg: {
+      name: 'query',
+      type: 'string',
+      required: true,
+      description: 'Song name or link',
+    },
+
+    async run(ctx, args) {
+      const query = String(
+        args.query || ''
+      ).trim();
+
+      if (!query) {
+        return ctx.reply(
+          err(
+            `Give me a song name or link. Example: \`${PREFIX}play lofi hip hop\``
+          )
+        );
+      }
+
+      const voiceChannel =
+        ctx.member?.voice?.channel;
+
+      if (!voiceChannel) {
+        return ctx.reply(
+          err('Join a voice channel first.')
+        );
+      }
+
+      const botVoiceChannel =
+        ctx.guild.members.me?.voice?.channel;
+
+      if (
+        botVoiceChannel &&
+        botVoiceChannel.id !== voiceChannel.id
+      ) {
+        return ctx.reply(
+          err(
+            `I'm already playing in ${botVoiceChannel}.`
+          )
+        );
+      }
+
       await ctx.defer();
- 
-      const withTimeout = (p, ms) =>
-        Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]);
- 
+
+      const withTimeout = (promise, milliseconds) =>
+        Promise.race([
+          promise,
+          new Promise((_, reject) =>
+            setTimeout(
+              () =>
+                reject(
+                  new Error(
+                    `Operation timed out after ${milliseconds}ms`
+                  )
+                ),
+              milliseconds
+            )
+          ),
+        ]);
+
       const options = {
         requestedBy: ctx.user,
+
         nodeOptions: {
-          metadata: { channel: ctx.channel },
+          metadata: {
+            channel: ctx.channel,
+          },
+
           volume: DEFAULT_VOLUME,
+
           selfDeaf: true,
+
           leaveOnEmpty: true,
           leaveOnEmptyCooldown: 60_000,
+
           leaveOnEnd: true,
           leaveOnEndCooldown: 60_000,
+
           leaveOnStop: true,
+
           skipFFmpeg: false,
         },
       };
- 
-      // Spotify links (track / playlist / album): read the track list from Spotify, play each song from SoundCloud.
-      if (/open\.spotify\.com|^spotify:/i.test(query)) {
-        let found;
+
+      // ─────────────────────────────
+      // SPOTIFY
+      // ─────────────────────────────
+
+      if (
+        /open\.spotify\.com|^spotify:/i.test(query)
+      ) {
+        let found = null;
+
         try {
-          found = await withTimeout(player.search(query, { requestedBy: ctx.user }), 25_000);
+          found = await withTimeout(
+            player.search(query, {
+              requestedBy: ctx.user,
+            }),
+            25_000
+          );
         } catch (e) {
-          console.error('Spotify search error:', e.message);
+          console.error(
+            '[SPOTIFY] Player search error:',
+            e.message
+          );
         }
- 
-        let list = (found?.tracks?.length ? found.tracks : found?.playlist?.tracks || []).map((t) => ({
-          title: t.title,
-          author: t.author,
-          durationMS: t.durationMS || 0,
+
+        let list = (
+          found?.tracks?.length
+            ? found.tracks
+            : found?.playlist?.tracks || []
+        ).map((track) => ({
+          title: track.title,
+          author: track.author,
+          durationMS:
+            track.durationMS || 0,
         }));
- 
-        console.log(`[SPOTIFY] extractor returned ${list.length} tracks`);
- 
+
+        console.log(
+          `[SPOTIFY] Extractor returned ${list.length} tracks`
+        );
+
         if (!list.length) {
           try {
-            list = await spotifyEmbedTracks(query);
-            console.log(`[SPOTIFY] embed fallback returned ${list.length} tracks`);
+            list = await spotifyEmbedTracks(
+              query
+            );
+
+            console.log(
+              `[SPOTIFY] Embed fallback returned ${list.length} tracks`
+            );
           } catch (e) {
-            console.error('[SPOTIFY] embed fallback failed:', e.message);
+            console.error(
+              '[SPOTIFY] Embed fallback failed:',
+              e.message
+            );
           }
         }
- 
+
         list = list.slice(0, 100);
-        if (!list.length) return ctx.reply(err('I could not read that Spotify link. Make sure the playlist is public.'));
- 
+
+        if (!list.length) {
+          return ctx.reply(
+            err(
+              'I could not read that Spotify link. Make sure the playlist is public.'
+            )
+          );
+        }
+
         const missing = [];
+
         let started = false;
-        let idx = 0;
- 
-        for (; idx < list.length && idx < 5 && !started; idx++) {
+        let index = 0;
+
+        for (
+          ;
+          index < list.length &&
+          index < 5 &&
+          !started;
+          index++
+        ) {
           try {
-            const sc = await findOnSoundCloud(list[idx], ctx.user, { strict: true });
-            if (!sc) {
-              missing.push(`${list[idx].title} - ${list[idx].author || ''}`.trim());
+            const soundCloudTrack =
+              await findOnSoundCloud(
+                list[index],
+                ctx.user,
+                { strict: true }
+              );
+
+            if (!soundCloudTrack) {
+              missing.push(
+                `${list[index].title} - ${
+                  list[index].author || ''
+                }`.trim()
+              );
+
               continue;
             }
-            await withTimeout(player.play(vc, sc, options), 25_000);
+
+            await withTimeout(
+              player.play(
+                voiceChannel,
+                soundCloudTrack,
+                options
+              ),
+              30_000
+            );
+
             started = true;
           } catch (e) {
-            console.error('Spotify -> SoundCloud error:', e.message);
+            console.error(
+              '[SPOTIFY → SOUNDCLOUD]',
+              e
+            );
           }
         }
- 
+
         if (!started) {
-          const q = getQueue(ctx.guild);
-          if (q && !q.currentTrack) q.delete();
-          return ctx.reply(err('I could not find those songs on SoundCloud.'));
+          const queue =
+            getQueue(ctx.guild);
+
+          if (
+            queue &&
+            !queue.currentTrack
+          ) {
+            try {
+              queue.delete();
+            } catch {}
+          }
+
+          return ctx.reply(
+            err(
+              'I could not find a playable song on SoundCloud.'
+            )
+          );
         }
- 
-        const title = found?.playlist?.title;
+
+        const playlistTitle =
+          found?.playlist?.title;
+
         await ctx.reply(
-          ok(title ? `Loading Spotify playlist **${title}** (${list.length} tracks)…` : `Queued **${list[0].title}**`)
+          ok(
+            playlistTitle
+              ? `Loading Spotify playlist **${playlistTitle}** (${list.length} tracks)…`
+              : `Queued **${list[0].title}**`
+          )
         );
- 
-        // Add the rest in the background so the first song starts right away.
+
+        // Add remaining tracks in background.
         (async () => {
           let added = 0;
-          for (; idx < list.length; idx++) {
-            const q = getQueue(ctx.guild);
-            if (!q) return; // bot was stopped
- 
+
+          for (
+            ;
+            index < list.length;
+            index++
+          ) {
+            const queue =
+              getQueue(ctx.guild);
+
+            if (!queue) {
+              return;
+            }
+
             try {
-              const sc = await findOnSoundCloud(list[idx], ctx.user, { strict: true });
-              if (sc) {
-                q.addTrack(sc);
+              const soundCloudTrack =
+                await findOnSoundCloud(
+                  list[index],
+                  ctx.user,
+                  { strict: true }
+                );
+
+              if (soundCloudTrack) {
+                queue.addTrack(
+                  soundCloudTrack
+                );
+
                 added++;
               } else {
-                missing.push(`${list[idx].title} - ${list[idx].author || ''}`.trim());
+                missing.push(
+                  `${list[index].title} - ${
+                    list[index].author || ''
+                  }`.trim()
+                );
               }
             } catch (e) {
-              console.error('Spotify -> SoundCloud error:', e.message);
+              console.error(
+                '[SPOTIFY → SOUNDCLOUD]',
+                e.message
+              );
             }
           }
- 
+
           const skipped = missing.length
-            ? `\n\n⚠️ Not found on SoundCloud (${missing.length}): ${missing.slice(0, 10).join(' • ')}${missing.length > 10 ? ' …' : ''}`
+            ? `\n\n⚠️ Not found on SoundCloud (${missing.length}): ${missing
+                .slice(0, 10)
+                .join(' • ')}${
+                missing.length > 10
+                  ? ' …'
+                  : ''
+              }`
             : '';
- 
-          ctx.channel?.send(ok(`Spotify playlist loaded: **${added + 1}** songs queued.${skipped}`)).catch(() => {});
+
+          ctx.channel
+            ?.send(
+              ok(
+                `Spotify playlist loaded: **${
+                  added + 1
+                }** songs queued.${skipped}`
+              )
+            )
+            .catch(() => {});
         })();
- 
+
         return;
       }
- 
-      // Links use the default (auto-detect) engine.
-      // Plain text searches try SoundCloud first (YouTube is often blocked/broken), then fall back to the default engine.
-      const isUrl = /^https?:\/\//i.test(query);
+
+      // ─────────────────────────────
+      // NORMAL SEARCH
+      // ─────────────────────────────
+
+      const isUrl =
+        /^https?:\/\//i.test(query);
+
       const attempts = [];
- 
+
       if (!isUrl) {
-        // Search SoundCloud and pick the best match (no previews / remixes unless asked for).
         try {
-          const best = await withTimeout(findOnSoundCloud(query, ctx.user), 40_000);
-          if (best) attempts.push({ label: 'SoundCloud', target: best, opts: options });
+          const best =
+            await withTimeout(
+              findOnSoundCloud(
+                query,
+                ctx.user
+              ),
+              40_000
+            );
+
+          if (best) {
+            attempts.push({
+              label: 'SoundCloud',
+              target: best,
+              opts: options,
+            });
+          }
         } catch (e) {
-          console.error('SoundCloud search error:', e.message);
+          console.error(
+            '[SOUNDCLOUD SEARCH]',
+            e.message
+          );
         }
       }
- 
-      attempts.push({ label: 'default', target: query, opts: options });
- 
-      let res;
-      for (const { label, target, opts } of attempts) {
+
+      attempts.push({
+        label: 'default',
+        target: query,
+        opts: options,
+      });
+
+      let result = null;
+
+      for (const attempt of attempts) {
         try {
-          res = await withTimeout(player.play(vc, target, opts), 25_000);
-          break;
+          console.log(
+            `[PLAY] Trying ${attempt.label}: ${query}`
+          );
+
+          result = await withTimeout(
+            player.play(
+              voiceChannel,
+              attempt.target,
+              attempt.opts
+            ),
+            30_000
+          );
+
+          if (result) {
+            console.log(
+              `[PLAY] Success using ${attempt.label}`
+            );
+
+            break;
+          }
         } catch (e) {
-          console.error(`Play error (${label} search):`, e.message);
+          console.error(
+            `[PLAY] Failed using ${attempt.label}:`,
+            e
+          );
         }
       }
- 
-      if (!res) {
-        const q = getQueue(ctx.guild);
-        if (q && !q.currentTrack) q.delete();
-        return ctx.reply(err('I could not find or play that. Try another name or link.'));
+
+      if (!result) {
+        const queue =
+          getQueue(ctx.guild);
+
+        if (
+          queue &&
+          !queue.currentTrack
+        ) {
+          try {
+            queue.delete();
+          } catch {}
+        }
+
+        return ctx.reply(
+          err(
+            'I could not find or play that. Check Railway logs for the exact playback error.'
+          )
+        );
       }
- 
-      const playlist = res.searchResult?.playlist;
+
+      const playlist =
+        result.searchResult?.playlist;
+
       if (playlist) {
-        return ctx.reply(ok(`Queued playlist **${playlist.title}** (${playlist.tracks.length} tracks)`));
+        return ctx.reply(
+          ok(
+            `Queued playlist **${playlist.title}** (${playlist.tracks.length} tracks)`
+          )
+        );
       }
- 
-      return ctx.reply(ok(`Queued [${res.track.title}](${res.track.url})`));
+
+      return ctx.reply(
+        ok(
+          `Queued [${result.track.title}](${result.track.url})`
+        )
+      );
     },
   },
+
+  // ─────────────────────────────
+  // SKIP
+  // ─────────────────────────────
+
   {
     name: 'skip',
     aliases: ['s', 'next'],
     description: 'Skip the current song',
+
     async run(ctx) {
-      const queue = await requireQueue(ctx);
+      const queue =
+        await requireQueue(ctx);
+
       if (!queue) return;
- 
-      const title = queue.currentTrack?.title || 'song';
+
+      const title =
+        queue.currentTrack?.title ||
+        'song';
+
       queue.node.skip();
-      return ctx.reply(ok(`Skipped **${title}**`));
+
+      return ctx.reply(
+        ok(`Skipped **${title}**`)
+      );
     },
   },
+
+  // ─────────────────────────────
+  // STOP
+  // ─────────────────────────────
+
   {
     name: 'stop',
-    aliases: ['leave', 'disconnect', 'dc'],
-    description: 'Stop the music and leave the voice channel',
+    aliases: [
+      'leave',
+      'disconnect',
+      'dc',
+    ],
+    description:
+      'Stop the music and leave the voice channel',
+
     async run(ctx) {
-      const queue = await requireQueue(ctx, { needPlaying: false });
+      const queue =
+        await requireQueue(ctx, {
+          needPlaying: false,
+        });
+
       if (!queue) return;
- 
+
       queue.delete();
-      return ctx.reply(ok('Stopped the music and left the channel.'));
+
+      return ctx.reply(
+        ok(
+          'Stopped the music and left the channel.'
+        )
+      );
     },
   },
+
+  // ─────────────────────────────
+  // PAUSE
+  // ─────────────────────────────
+
   {
     name: 'pause',
     description: 'Pause the music',
+
     async run(ctx) {
-      const queue = await requireQueue(ctx);
+      const queue =
+        await requireQueue(ctx);
+
       if (!queue) return;
- 
-      if (queue.node.isPaused()) return ctx.reply(err('Already paused.'));
- 
+
+      if (queue.node.isPaused()) {
+        return ctx.reply(
+          err('Already paused.')
+        );
+      }
+
       queue.node.setPaused(true);
-      return ctx.reply(ok('Paused.'));
+
+      return ctx.reply(
+        ok('Paused.')
+      );
     },
   },
+
+  // ─────────────────────────────
+  // RESUME
+  // ─────────────────────────────
+
   {
     name: 'resume',
     aliases: ['unpause'],
     description: 'Resume the music',
+
     async run(ctx) {
-      const queue = await requireQueue(ctx);
+      const queue =
+        await requireQueue(ctx);
+
       if (!queue) return;
- 
-      if (!queue.node.isPaused()) return ctx.reply(err('The music is not paused.'));
- 
+
+      if (!queue.node.isPaused()) {
+        return ctx.reply(
+          err(
+            'The music is not paused.'
+          )
+        );
+      }
+
       queue.node.setPaused(false);
-      return ctx.reply(ok('Resumed.'));
+
+      return ctx.reply(
+        ok('Resumed.')
+      );
     },
   },
+
+  // ─────────────────────────────
+  // NOW PLAYING
+  // ─────────────────────────────
+
   {
     name: 'nowplaying',
     aliases: ['np', 'current'],
-    description: 'Show the current song',
+    description:
+      'Show the current song',
+
     async run(ctx) {
-      const queue = getQueue(ctx.guild);
-      if (!queue?.currentTrack) return ctx.reply(err('Nothing is playing right now.'));
- 
-      const t = queue.currentTrack;
-      const embed = new EmbedBuilder()
-        .setColor(COLOR)
-        .setTitle('Now Playing')
-        .setDescription(`[${t.title}](${t.url})\nby **${t.author}**\n\n${queue.node.createProgressBar()}`)
-        .setFooter({ text: `Requested by ${t.requestedBy?.username || 'unknown'}` });
- 
-      if (t.thumbnail) embed.setThumbnail(t.thumbnail);
- 
-      return ctx.reply({ embeds: [embed] });
+      const queue =
+        getQueue(ctx.guild);
+
+      if (!queue?.currentTrack) {
+        return ctx.reply(
+          err(
+            'Nothing is playing right now.'
+          )
+        );
+      }
+
+      const track =
+        queue.currentTrack;
+
+      const embed =
+        new EmbedBuilder()
+          .setColor(COLOR)
+          .setTitle('Now Playing')
+          .setDescription(
+            `[${track.title}](${track.url})\nby **${track.author}**\n\n${queue.node.createProgressBar()}`
+          )
+          .setFooter({
+            text: `Requested by ${
+              track.requestedBy?.username ||
+              'unknown'
+            }`,
+          });
+
+      if (track.thumbnail) {
+        embed.setThumbnail(
+          track.thumbnail
+        );
+      }
+
+      return ctx.reply({
+        embeds: [embed],
+      });
     },
   },
+
+  // ─────────────────────────────
+  // QUEUE
+  // ─────────────────────────────
+
   {
     name: 'queue',
     aliases: ['q'],
     description: 'Show the queue',
+
     async run(ctx) {
-      const queue = getQueue(ctx.guild);
-      if (!queue?.currentTrack) return ctx.reply(err('The queue is empty.'));
- 
-      const tracks = queue.tracks.toArray();
-      const lines = tracks.slice(0, 10).map((t, i) => `\`${i + 1}.\` [${t.title}](${t.url}) • ${t.duration}`);
-      const more = tracks.length > 10 ? `\n…and **${tracks.length - 10}** more` : '';
- 
-      const embed = new EmbedBuilder()
-        .setColor(COLOR)
-        .setTitle('Queue')
-        .setDescription(
-          `**Now playing:** [${queue.currentTrack.title}](${queue.currentTrack.url})\n\n` +
-            (lines.length ? lines.join('\n') + more : 'No songs up next.')
+      const queue =
+        getQueue(ctx.guild);
+
+      if (!queue?.currentTrack) {
+        return ctx.reply(
+          err(
+            'The queue is empty.'
+          )
         );
- 
-      return ctx.reply({ embeds: [embed] });
+      }
+
+      const tracks =
+        queue.tracks.toArray();
+
+      const lines =
+        tracks
+          .slice(0, 10)
+          .map(
+            (track, index) =>
+              `\`${index + 1}.\` [${track.title}](${track.url}) • ${track.duration}`
+          );
+
+      const more =
+        tracks.length > 10
+          ? `\n…and **${
+              tracks.length - 10
+            }** more`
+          : '';
+
+      const embed =
+        new EmbedBuilder()
+          .setColor(COLOR)
+          .setTitle('Queue')
+          .setDescription(
+            `**Now playing:** [${queue.currentTrack.title}](${queue.currentTrack.url})\n\n` +
+              (lines.length
+                ? lines.join('\n') +
+                  more
+                : 'No songs up next.')
+          );
+
+      return ctx.reply({
+        embeds: [embed],
+      });
     },
   },
+
+  // ─────────────────────────────
+  // VOLUME
+  // ─────────────────────────────
+
   {
     name: 'volume',
     aliases: ['vol'],
-    description: 'Set the volume (1-100)',
-    arg: { name: 'amount', type: 'number', required: false, description: 'Volume from 1 to 100' },
-    async run(ctx, a) {
-      const queue = await requireQueue(ctx);
+    description:
+      'Set the volume (1-100)',
+
+    arg: {
+      name: 'amount',
+      type: 'number',
+      required: false,
+      description:
+        'Volume from 1 to 100',
+    },
+
+    async run(ctx, args) {
+      const queue =
+        await requireQueue(ctx);
+
       if (!queue) return;
- 
-      if (a.amount === undefined || a.amount === null || Number.isNaN(a.amount)) {
-        return ctx.reply(box(`🔊 Current volume: **${queue.node.volume}%**`));
+
+      if (
+        args.amount === undefined ||
+        args.amount === null ||
+        Number.isNaN(args.amount)
+      ) {
+        return ctx.reply(
+          box(
+            `🔊 Current volume: **${queue.node.volume}%**`
+          )
+        );
       }
- 
-      if (a.amount < 1 || a.amount > 100) return ctx.reply(err('Volume must be between 1 and 100.'));
- 
-      queue.node.setVolume(a.amount);
-      return ctx.reply(ok(`Volume set to **${a.amount}%**`));
+
+      if (
+        args.amount < 1 ||
+        args.amount > 100
+      ) {
+        return ctx.reply(
+          err(
+            'Volume must be between 1 and 100.'
+          )
+        );
+      }
+
+      queue.node.setVolume(
+        args.amount
+      );
+
+      return ctx.reply(
+        ok(
+          `Volume set to **${args.amount}%**`
+        )
+      );
     },
   },
+
+  // ─────────────────────────────
+  // LOOP
+  // ─────────────────────────────
+
   {
     name: 'loop',
     aliases: ['repeat'],
-    description: 'Set loop mode: off, track, queue or autoplay',
+    description:
+      'Set loop mode: off, track, queue or autoplay',
+
     arg: {
       name: 'mode',
       type: 'string',
       required: true,
-      description: 'off, track, queue or autoplay',
-      choices: ['off', 'track', 'queue', 'autoplay'],
+      description:
+        'off, track, queue or autoplay',
+
+      choices: [
+        'off',
+        'track',
+        'queue',
+        'autoplay',
+      ],
     },
-    async run(ctx, a) {
-      const queue = await requireQueue(ctx);
+
+    async run(ctx, args) {
+      const queue =
+        await requireQueue(ctx);
+
       if (!queue) return;
- 
+
       const modes = {
         off: QueueRepeatMode.OFF,
         track: QueueRepeatMode.TRACK,
         queue: QueueRepeatMode.QUEUE,
-        autoplay: QueueRepeatMode.AUTOPLAY,
+        autoplay:
+          QueueRepeatMode.AUTOPLAY,
       };
- 
-      const mode = String(a.mode || '').toLowerCase();
-      if (!(mode in modes)) return ctx.reply(err('Use: `off`, `track`, `queue` or `autoplay`.'));
- 
-      queue.setRepeatMode(modes[mode]);
-      return ctx.reply(ok(`Loop mode: **${mode}**`));
+
+      const mode =
+        String(args.mode || '')
+          .toLowerCase();
+
+      if (!(mode in modes)) {
+        return ctx.reply(
+          err(
+            'Use: `off`, `track`, `queue` or `autoplay`.'
+          )
+        );
+      }
+
+      queue.setRepeatMode(
+        modes[mode]
+      );
+
+      return ctx.reply(
+        ok(
+          `Loop mode: **${mode}**`
+        )
+      );
     },
   },
+
+  // ─────────────────────────────
+  // SHUFFLE
+  // ─────────────────────────────
+
   {
     name: 'shuffle',
     description: 'Shuffle the queue',
+
     async run(ctx) {
-      const queue = await requireQueue(ctx);
+      const queue =
+        await requireQueue(ctx);
+
       if (!queue) return;
- 
-      if (queue.tracks.size < 2) return ctx.reply(err('Not enough songs in the queue to shuffle.'));
- 
+
+      if (queue.tracks.size < 2) {
+        return ctx.reply(
+          err(
+            'Not enough songs in the queue to shuffle.'
+          )
+        );
+      }
+
       queue.tracks.shuffle();
-      return ctx.reply(ok('Queue shuffled.'));
+
+      return ctx.reply(
+        ok('Queue shuffled.')
+      );
     },
   },
+
+  // ─────────────────────────────
+  // REMOVE
+  // ─────────────────────────────
+
   {
     name: 'remove',
-    description: 'Remove a song from the queue by its number',
-    arg: { name: 'position', type: 'number', required: true, description: 'Song number in the queue' },
-    async run(ctx, a) {
-      const queue = await requireQueue(ctx);
+    description:
+      'Remove a song from the queue by its number',
+
+    arg: {
+      name: 'position',
+      type: 'number',
+      required: true,
+      description:
+        'Song number in the queue',
+    },
+
+    async run(ctx, args) {
+      const queue =
+        await requireQueue(ctx);
+
       if (!queue) return;
- 
-      const pos = a.position;
-      if (!pos || pos < 1 || pos > queue.tracks.size) return ctx.reply(err('That position is not in the queue.'));
- 
-      const removed = queue.removeTrack(pos - 1);
-      return ctx.reply(ok(`Removed **${removed?.title || 'song'}**`));
+
+      const position =
+        args.position;
+
+      if (
+        !position ||
+        position < 1 ||
+        position > queue.tracks.size
+      ) {
+        return ctx.reply(
+          err(
+            'That position is not in the queue.'
+          )
+        );
+      }
+
+      const removed =
+        queue.removeTrack(
+          position - 1
+        );
+
+      return ctx.reply(
+        ok(
+          `Removed **${
+            removed?.title || 'song'
+          }**`
+        )
+      );
     },
   },
+
+  // ─────────────────────────────
+  // SKIPTO
+  // ─────────────────────────────
+
   {
     name: 'skipto',
-    description: 'Skip to a song in the queue',
-    arg: { name: 'position', type: 'number', required: true, description: 'Song number in the queue' },
-    async run(ctx, a) {
-      const queue = await requireQueue(ctx);
+    description:
+      'Skip to a song in the queue',
+
+    arg: {
+      name: 'position',
+      type: 'number',
+      required: true,
+      description:
+        'Song number in the queue',
+    },
+
+    async run(ctx, args) {
+      const queue =
+        await requireQueue(ctx);
+
       if (!queue) return;
- 
-      const pos = a.position;
-      if (!pos || pos < 1 || pos > queue.tracks.size) return ctx.reply(err('That position is not in the queue.'));
- 
-      queue.node.skipTo(pos - 1);
-      return ctx.reply(ok(`Skipped to song **#${pos}**`));
+
+      const position =
+        args.position;
+
+      if (
+        !position ||
+        position < 1 ||
+        position > queue.tracks.size
+      ) {
+        return ctx.reply(
+          err(
+            'That position is not in the queue.'
+          )
+        );
+      }
+
+      queue.node.skipTo(
+        position - 1
+      );
+
+      return ctx.reply(
+        ok(
+          `Skipped to song **#${position}**`
+        )
+      );
     },
   },
+
+  // ─────────────────────────────
+  // SEEK
+  // ─────────────────────────────
+
   {
     name: 'seek',
-    description: 'Jump to a time in the current song (seconds)',
-    arg: { name: 'seconds', type: 'number', required: true, description: 'Time in seconds' },
-    async run(ctx, a) {
-      const queue = await requireQueue(ctx);
+    description:
+      'Jump to a time in the current song (seconds)',
+
+    arg: {
+      name: 'seconds',
+      type: 'number',
+      required: true,
+      description:
+        'Time in seconds',
+    },
+
+    async run(ctx, args) {
+      const queue =
+        await requireQueue(ctx);
+
       if (!queue) return;
- 
-      if (a.seconds === undefined || Number.isNaN(a.seconds) || a.seconds < 0) {
-        return ctx.reply(err('Give me a time in seconds.'));
+
+      if (
+        args.seconds === undefined ||
+        Number.isNaN(args.seconds) ||
+        args.seconds < 0
+      ) {
+        return ctx.reply(
+          err(
+            'Give me a time in seconds.'
+          )
+        );
       }
- 
+
       try {
-        await queue.node.seek(a.seconds * 1000);
-        return ctx.reply(ok(`Jumped to **${a.seconds}s**`));
+        await queue.node.seek(
+          args.seconds * 1000
+        );
+
+        return ctx.reply(
+          ok(
+            `Jumped to **${args.seconds}s**`
+          )
+        );
       } catch (e) {
-        console.error('Seek error:', e.message);
-        return ctx.reply(err('I could not seek in this song.'));
+        console.error(
+          '[SEEK]',
+          e
+        );
+
+        return ctx.reply(
+          err(
+            'I could not seek in this song.'
+          )
+        );
       }
     },
   },
+
+  // ─────────────────────────────
+  // CLEAR
+  // ─────────────────────────────
+
   {
     name: 'clear',
-    description: 'Clear the queue (keeps the current song)',
+    description:
+      'Clear the queue (keeps the current song)',
+
     async run(ctx) {
-      const queue = await requireQueue(ctx);
+      const queue =
+        await requireQueue(ctx);
+
       if (!queue) return;
- 
+
       queue.tracks.clear();
-      return ctx.reply(ok('Queue cleared.'));
+
+      return ctx.reply(
+        ok('Queue cleared.')
+      );
     },
   },
+
+  // ─────────────────────────────
+  // DEPS
+  // ─────────────────────────────
+
   {
     name: 'deps',
-    description: 'Show the audio dependency report (for debugging)',
+    description:
+      'Show the audio dependency report',
+
     async run(ctx) {
-      const report = String(player.scanDeps()).slice(0, 1800);
-      return ctx.reply('```\n' + report + '\n```');
+      try {
+        const report =
+          String(
+            player.scanDeps()
+          ).slice(0, 1800);
+
+        return ctx.reply(
+          '```\n' +
+            report +
+            '\n```'
+        );
+      } catch (e) {
+        return ctx.reply(
+          err(
+            `Dependency scan failed: ${e.message}`
+          )
+        );
+      }
     },
   },
+
+  // ─────────────────────────────
+  // HELP
+  // ─────────────────────────────
+
   {
     name: 'help',
-    aliases: ['h', 'commands'],
-    description: 'Show all commands',
+    aliases: [
+      'h',
+      'commands',
+    ],
+    description:
+      'Show all commands',
+
     async run(ctx) {
-      const list = commands
-        .map((c) => `\`${PREFIX}${c.name}\` or \`/${c.name}\` — ${c.description}`)
-        .join('\n');
- 
-      const embed = new EmbedBuilder()
-        .setColor(COLOR)
-        .setTitle('Music Commands')
-        .setDescription(list);
- 
-      return ctx.reply({ embeds: [embed] });
+      const list =
+        commands
+          .map(
+            (command) =>
+              `\`${PREFIX}${command.name}\` or \`/${command.name}\` — ${command.description}`
+          )
+          .join('\n');
+
+      const embed =
+        new EmbedBuilder()
+          .setColor(COLOR)
+          .setTitle(
+            'Music Commands'
+          )
+          .setDescription(list);
+
+      return ctx.reply({
+        embeds: [embed],
+      });
     },
   },
 ];
- 
+
+// ─────────────────────────────────────────────
+// COMMAND MAP
+// ─────────────────────────────────────────────
+
 const byName = new Map();
-for (const c of commands) {
-  byName.set(c.name, c);
-  for (const al of c.aliases || []) byName.set(al, c);
+
+for (const command of commands) {
+  byName.set(
+    command.name,
+    command
+  );
+
+  for (const alias of command.aliases || []) {
+    byName.set(
+      alias,
+      command
+    );
+  }
 }
- 
-// ───────────── CONTEXT WRAPPERS (same command code for slash + prefix) ─────────────
-function slashCtx(i) {
+
+// ─────────────────────────────────────────────
+// CONTEXT WRAPPERS
+// ─────────────────────────────────────────────
+
+function slashCtx(interaction) {
   return {
-    user: i.user,
-    member: i.member,
-    guild: i.guild,
-    channel: i.channel,
-    defer: () => i.deferReply().catch(() => {}),
-    reply: (p) => (i.deferred || i.replied ? i.editReply(p).catch(() => {}) : i.reply(p).catch(() => {})),
-  };
-}
- 
-function prefixCtx(m) {
-  return {
-    user: m.author,
-    member: m.member,
-    guild: m.guild,
-    channel: m.channel,
-    defer: () => m.channel.sendTyping().catch(() => {}),
-    reply: (p) => {
-      const payload = typeof p === 'string' ? { content: p } : p;
-      return m
-        .reply({ ...payload, allowedMentions: { repliedUser: false } })
-        .catch(() => m.channel.send({ ...payload, allowedMentions: { parse: [] } }).catch(() => {}));
+    user: interaction.user,
+
+    member: interaction.member,
+
+    guild: interaction.guild,
+
+    channel: interaction.channel,
+
+    defer: () =>
+      interaction
+        .deferReply()
+        .catch(() => {}),
+
+    reply: (payload) => {
+      if (
+        interaction.deferred ||
+        interaction.replied
+      ) {
+        return interaction
+          .editReply(payload)
+          .catch(() => {});
+      }
+
+      return interaction
+        .reply(payload)
+        .catch(() => {});
     },
   };
 }
- 
-// ───────────── PLAYER EVENTS ─────────────
-const startedAt = new Map();
- 
-player.events.on('playerStart', (queue, track) => {
-  startedAt.set(queue.guild.id, Date.now());
- 
-  const embed = new EmbedBuilder()
-    .setColor(COLOR)
-    .setTitle('Now Playing')
-    .setDescription(`[${track.title}](${track.url})\nby **${track.author}** • ${track.duration}`)
-    .setFooter({ text: `Requested by ${track.requestedBy?.username || 'unknown'}` });
- 
-  if (track.thumbnail) embed.setThumbnail(track.thumbnail);
- 
-  queue.metadata?.channel?.send({ embeds: [embed] }).catch(() => {});
-});
- 
-player.events.on('playerFinish', (queue, track) => {
-  const elapsed = Date.now() - (startedAt.get(queue.guild.id) || 0);
-  console.log(`[FINISH] ${track.title} (${track.duration}) after ${Math.round(elapsed / 1000)}s`);
- 
-  // Only log error if song finished TOO quickly (< 3s) and it's a long song
-  if (elapsed < 3000 && track.durationMS > 20_000) {
-    console.error(`[ERROR] Track finished instantly: ${track.title} (expected ${track.duration})`);
-    console.error(`[ERROR] Possible causes:`);
-    console.error(`  - FFmpeg is not working correctly`);
-    console.error(`  - Audio stream format is incompatible`);
-    console.error(`  - Missing audio encoding dependencies (opusscript)`);
-    console.error(`[ERROR] Check that opusscript and libsodium-wrappers are installed`);
-  }
-});
- 
-player.events.on('willPlayTrack', (queue, track, config, resolve) => {
-  const d = config.dispatcherConfig;
-  d.disableEqualizer = true;
-  d.disableBiquad = true;
-  d.disableResampler = true;
-  d.disableFilters = true;
-  resolve();
-});
- 
-player.events.on('audioTrackAdd', (queue, track) => {
-  console.log(`[ADDED] ${track.title} | ${track.duration} | ${track.url}`);
-});
- 
-player.events.on('connection', () => console.log('[VOICE] connected'));
-player.events.on('disconnect', () => console.log('[VOICE] disconnected'));
- 
-player.events.on('emptyQueue', (queue) => {
-  queue.metadata?.channel?.send(box('The queue has finished. Add more songs with `' + PREFIX + 'play`.')).catch(() => {});
-});
- 
-player.events.on('error', (queue, error) => {
-  console.error('[PLAYER] Queue error:', error);
-});
- 
-player.events.on('playerError', (queue, error) => {
-  console.error('[PLAYER] Player error:', error);
-  queue.metadata?.channel
-    ?.send(err(`Playback error: \`${String(error?.message || error).slice(0, 300)}\``))
-    .catch(() => {});
-});
- 
-player.events.on('playerSkip', (queue, track, reason, description) => {
-  console.log(`[PLAYER] Skipped track: ${track.title} | reason: ${reason} | ${description}`);
-  queue.metadata?.channel?.send(err(`I could not stream **${track.title}** (${reason}).`)).catch(() => {});
-});
- 
-if (process.env.DEBUG_PLAYER !== '0') {
-  player.events.on('debug', (queue, message) => {
-    remember(message);
-    if (!NOISY.test(message)) console.log(`[DEBUG queue] ${message}`);
-  });
- 
-  player.on('debug', (message) => {
-    remember(message);
-    if (!NOISY.test(message)) console.log(`[DEBUG player] ${message}`);
-  });
-}
- 
-// ───────────── CLIENT EVENTS ─────────────
-client.once('ready', async () => {
-  console.log(`✅ Logged in as ${client.user.tag}`);
- 
-  // Load extractors for discord-player v6
-  try {
-    await player.extractors.loadDefault();
-    console.log('✅ Default extractors loaded.');
-  } catch (e) {
-    console.error('⚠️ Default extractors failed to load:', e.message);
-  }
- 
-  try {
-    if (YoutubeiExtractor) {
-      await player.extractors.register(YoutubeiExtractor, {});
-      console.log('✅ YouTube extractor loaded.');
-    }
-  } catch (e) {
-    console.error('⚠️ YouTube extractor failed to load, continuing without it:', e.message);
-  }
- 
-  console.log('✅ Extractors loaded.');
-  console.log(player.scanDeps());
- 
-  const body = commands.map((c) => ({
-    name: c.name,
-    description: c.description,
-    options: c.arg
-      ? [
-          {
-            type: c.arg.type === 'number' ? 4 : 3, // 4 = integer, 3 = string
-            name: c.arg.name,
-            description: c.arg.description,
-            required: !!c.arg.required,
-            ...(c.arg.choices ? { choices: c.arg.choices.map((x) => ({ name: x, value: x })) } : {}),
+
+function prefixCtx(message) {
+  return {
+    user: message.author,
+
+    member: message.member,
+
+    guild: message.guild,
+
+    channel: message.channel,
+
+    defer: () =>
+      message.channel
+        .sendTyping()
+        .catch(() => {}),
+
+    reply: (payload) => {
+      const data =
+        typeof payload === 'string'
+          ? { content: payload }
+          : payload;
+
+      return message
+        .reply({
+          ...data,
+
+          allowedMentions: {
+            repliedUser: false,
           },
-        ]
-      : [],
-  }));
- 
-  try {
-    if (GUILD_ID) {
-      const guild = await client.guilds.fetch(GUILD_ID);
-      await guild.commands.set(body);
-      console.log('✅ Slash commands registered for your server.');
-    } else {
-      await client.application.commands.set(body);
-      console.log('✅ Slash commands registered globally (can take up to an hour to show).');
+        })
+        .catch(() =>
+          message.channel
+            .send({
+              ...data,
+
+              allowedMentions: {
+                parse: [],
+              },
+            })
+            .catch(() => {})
+        );
+    },
+  };
+}
+
+// ─────────────────────────────────────────────
+// PLAYER EVENTS
+// ─────────────────────────────────────────────
+
+const startedAt = new Map();
+
+player.events.on(
+  'playerStart',
+  (queue, track) => {
+    startedAt.set(
+      queue.guild.id,
+      Date.now()
+    );
+
+    console.log(
+      `🎵 STARTED: ${track.title} | ${track.duration}`
+    );
+
+    const embed =
+      new EmbedBuilder()
+        .setColor(COLOR)
+        .setTitle(
+          'Now Playing'
+        )
+        .setDescription(
+          `[${track.title}](${track.url})\nby **${track.author}** • ${track.duration}`
+        )
+        .setFooter({
+          text: `Requested by ${
+            track.requestedBy
+              ?.username || 'unknown'
+          }`,
+        });
+
+    if (track.thumbnail) {
+      embed.setThumbnail(
+        track.thumbnail
+      );
     }
-  } catch (e) {
-    console.error('❌ Could not register slash commands:', e.message);
+
+    queue.metadata?.channel
+      ?.send({
+        embeds: [embed],
+      })
+      .catch(() => {});
   }
- 
-  client.user.setPresence({
-    activities: [{ name: `${PREFIX}help | /help` }],
-    status: 'online'
-  });
-});
- 
-client.on('interactionCreate', async (i) => {
-  if (!i.isChatInputCommand() || !i.guild) return;
- 
-  const cmd = byName.get(i.commandName);
-  if (!cmd) return;
- 
-  const args = cmd.arg ? { [cmd.arg.name]: i.options.get(cmd.arg.name)?.value } : {};
- 
-  try {
-    await cmd.run(slashCtx(i), args);
-  } catch (e) {
-    console.error('[INTERACTION] Slash command error:', e);
-    const msg = { ...err('Something went wrong.'), flags: MessageFlags.Ephemeral };
- 
+);
+
+player.events.on(
+  'playerFinish',
+  (queue, track) => {
+    const elapsed =
+      Date.now() -
+      (startedAt.get(
+        queue.guild.id
+      ) || 0);
+
+    console.log(
+      `[FINISH] ${track.title} (${track.duration}) after ${Math.round(
+        elapsed / 1000
+      )}s`
+    );
+
+    if (
+      elapsed < 3000 &&
+      track.durationMS > 20_000
+    ) {
+      console.error(
+        `[ERROR] Track finished too quickly: ${track.title}`
+      );
+    }
+  }
+);
+
+// IMPORTANT:
+// Do not assume dispatcherConfig exists.
+player.events.on(
+  'willPlayTrack',
+  (
+    queue,
+    track,
+    config,
+    resolve
+  ) => {
     try {
-      if (i.deferred || i.replied) {
-        await i.followUp(msg);
-      } else {
-        await i.reply(msg);
+      if (
+        config?.dispatcherConfig
+      ) {
+        config.dispatcherConfig.disableEqualizer =
+          true;
+
+        config.dispatcherConfig.disableBiquad =
+          true;
+
+        config.dispatcherConfig.disableResampler =
+          true;
+
+        config.dispatcherConfig.disableFilters =
+          true;
       }
-    } catch (replyError) {
-      console.error('[INTERACTION] Could not send error message:', replyError.message);
+    } catch (e) {
+      console.error(
+        '[PLAYER] willPlayTrack configuration error:',
+        e.message
+      );
+    }
+
+    if (typeof resolve === 'function') {
+      resolve();
     }
   }
-});
- 
-client.on('messageCreate', async (m) => {
-  if (m.author.bot || !m.guild || !m.content.startsWith(PREFIX)) return;
- 
-  const [name, ...rest] = m.content.slice(PREFIX.length).trim().split(/\s+/);
-  const cmd = byName.get((name || '').toLowerCase());
-  if (!cmd) return;
- 
-  const text = rest.join(' ').trim();
-  let args = {};
-  if (cmd.arg) {
-    args[cmd.arg.name] = cmd.arg.type === 'number' ? (text ? Number(text) : undefined) : text;
+);
+
+player.events.on(
+  'audioTrackAdd',
+  (queue, track) => {
+    console.log(
+      `[ADDED] ${track.title} | ${track.duration} | ${track.url}`
+    );
   }
- 
-  try {
-    await cmd.run(prefixCtx(m), args);
-  } catch (e) {
-    console.error('[MESSAGE] Prefix command error:', e);
-    m.reply(err('Something went wrong.')).catch(() => {});
+);
+
+player.events.on(
+  'connection',
+  () => {
+    console.log(
+      '[VOICE] connected'
+    );
   }
-});
- 
-client.on('error', (e) => console.error('[CLIENT] Client error:', e));
- 
-process.on('unhandledRejection', (e) => {
-  console.error('[PROCESS] Unhandled rejection:', e);
-});
- 
-process.on('uncaughtException', (e) => {
-  console.error('[PROCESS] Uncaught exception:', e);
-  process.exit(1);
-});
- 
-client.login(TOKEN).catch((e) => {
-  console.error(`❌ Login failed: ${e.message}. The token is wrong or was reset — paste the NEW token in Railway Variables.`);
-  process.exit(1);
-});
+);
+
+player.events.on(
+  'disconnect',
+  () => {
+    console.log(
+      '[VOICE] disconnected'
+    );
+  }
+);
+
+player.events.on(
+  'emptyQueue',
+  (queue) => {
+    queue.metadata?.channel
+      ?.send(
+        box(
+          `The queue has finished. Add more songs with \`${PREFIX}play\`.`
+        )
+      )
+      .catch(() => {});
+  }
+);
+
+player.events.on(
+  'error',
+  (queue, error) => {
+    console.error(
+      '[PLAYER] Queue error:',
+      error
+    );
+  }
+);
+
+player.events.on(
+  'playerError',
+  (queue, error) => {
+    console.error(
+      '[PLAYER] Player error:',
+      error
+    );
+
+    queue.metadata?.channel
+      ?.send(
+        err(
+          `Playback error: \`${String(
+            error?.message || error
+          ).slice(0, 500)}\``
+        )
+      )
+      .catch(() => {});
+  }
+);
+
+player.events.on(
+  'playerSkip',
+  (
+    queue,
+    track,
+    reason,
+    description
+  ) => {
+    console.log(
+      `[PLAYER] Skipped track: ${track.title} | reason: ${reason} | ${description || ''}`
+    );
+
+    queue.metadata?.channel
+      ?.send(
+        err(
+          `I could not stream **${track.title}** (${reason}).`
+        )
+      )
+      .catch(() => {});
+  }
+);
+
+// ─────────────────────────────────────────────
+// PLAYER DEBUG
+// ─────────────────────────────────────────────
+
+if (
+  process.env.DEBUG_PLAYER !== '0'
+) {
+  player.events.on(
+    'debug',
+    (queue, message) => {
+      remember(message);
+
+      if (!NOISY.test(message)) {
+        console.log(
+          `[DEBUG queue] ${message}`
+        );
+      }
+    }
+  );
+
+  player.on(
+    'debug',
+    (message) => {
+      remember(message);
+
+      if (!NOISY.test(message)) {
+        console.log(
+          `[DEBUG player] ${message}`
+        );
+      }
+    }
+  );
+}
+
+// ─────────────────────────────────────────────
+// READY
+// ─────────────────────────────────────────────
+
+client.once(
+  'ready',
+  async () => {
+    console.log(
+      `✅ Logged in as ${client.user.tag} (${client.user.id})`
+    );
+
+    // Discord Player v7:
+    // Load all default extractors.
+    try {
+      await player.extractors.loadMulti(
+        DefaultExtractors
+      );
+
+      console.log(
+        '✅ Default extractors loaded.'
+      );
+    } catch (e) {
+      console.error(
+        '❌ Default extractors failed:',
+        e
+      );
+    }
+
+    // Optional YouTubei extractor.
+    if (YoutubeiExtractor) {
+      try {
+        await player.extractors.register(
+          YoutubeiExtractor,
+          {}
+        );
+
+        console.log(
+          '✅ YouTubei extractor loaded.'
+        );
+      } catch (e) {
+        console.error(
+          '⚠️ YouTubei extractor failed:',
+          e.message
+        );
+      }
+    }
+
+    console.log(
+      '🔎 Audio dependency report:'
+    );
+
+    try {
+      console.log(
+        player.scanDeps()
+      );
+    } catch (e) {
+      console.error(
+        'Could not scan dependencies:',
+        e.message
+      );
+    }
+
+    const body =
+      commands.map(
+        (command) => ({
+          name: command.name,
+
+          description:
+            command.description,
+
+          options: command.arg
+            ? [
+                {
+                  type:
+                    command.arg.type ===
+                    'number'
+                      ? 4
+                      : 3,
+
+                  name:
+                    command.arg.name,
+
+                  description:
+                    command.arg
+                      .description,
+
+                  required:
+                    !!command.arg
+                      .required,
+
+                  ...(command.arg
+                    .choices
+                    ? {
+                        choices:
+                          command.arg.choices.map(
+                            (choice) => ({
+                              name: choice,
+                              value: choice,
+                            })
+                          ),
+                      }
+                    : {}),
+                },
+              ]
+            : [],
+        })
+      );
+
+    try {
+      if (GUILD_ID) {
+        const guild =
+          await client.guilds.fetch(
+            GUILD_ID
+          );
+
+        await guild.commands.set(
+          body
+        );
+
+        console.log(
+          `✅ Slash commands registered in guild ${guild.id}.`
+        );
+      } else {
+        await client.application.commands.set(
+          body
+        );
+
+        console.log(
+          '✅ Slash commands registered globally.'
+        );
+      }
+    } catch (e) {
+      console.error(
+        '❌ Could not register slash commands:',
+        e
+      );
+    }
+
+    client.user.setPresence({
+      activities: [
+        {
+          name: `${PREFIX}help | /help`,
+        },
+      ],
+
+      status: 'online',
+    });
+
+    console.log(
+      '🟢 Music bot is ready.'
+    );
+  }
+);
+
+// ─────────────────────────────────────────────
+// SLASH COMMANDS
+// ─────────────────────────────────────────────
+
+client.on(
+  'interactionCreate',
+  async (interaction) => {
+    if (
+      !interaction.isChatInputCommand() ||
+      !interaction.guild
+    ) {
+      return;
+    }
+
+    const command =
+      byName.get(
+        interaction.commandName
+      );
+
+    if (!command) {
+      return;
+    }
+
+    const args = command.arg
+      ? {
+          [command.arg.name]:
+            interaction.options.get(
+              command.arg.name
+            )?.value,
+        }
+      : {};
+
+    try {
+      await command.run(
+        slashCtx(interaction),
+        args
+      );
+    } catch (e) {
+      console.error(
+        `[INTERACTION] /${interaction.commandName} failed:`,
+        e
+      );
+
+      const errorText =
+        String(
+          e?.message || e
+        ).slice(0, 700);
+
+      const payload = {
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0xff3333)
+            .setDescription(
+              `❌ **Something went wrong.**\n\`\`\`\n${errorText}\n\`\`\``
+            ),
+        ],
+
+        flags: MessageFlags.Ephemeral,
+      };
+
+      try {
+        if (
+          interaction.deferred ||
+          interaction.replied
+        ) {
+          await interaction.followUp(
+            payload
+          );
+        } else {
+          await interaction.reply(
+            payload
+          );
+        }
+      } catch (replyError) {
+        console.error(
+          '[INTERACTION] Could not send error:',
+          replyError
+        );
+      }
+    }
+  }
+);
+
+// ─────────────────────────────────────────────
+// PREFIX COMMANDS
+// ─────────────────────────────────────────────
+
+client.on(
+  'messageCreate',
+  async (message) => {
+    if (
+      message.author.bot ||
+      !message.guild ||
+      !message.content.startsWith(
+        PREFIX
+      )
+    ) {
+      return;
+    }
+
+    const [
+      commandName,
+      ...rest
+    ] =
+      message.content
+        .slice(PREFIX.length)
+        .trim()
+        .split(/\s+/);
+
+    const command =
+      byName.get(
+        (
+          commandName || ''
+        ).toLowerCase()
+      );
+
+    if (!command) {
+      return;
+    }
+
+    const text =
+      rest.join(' ').trim();
+
+    let args = {};
+
+    if (command.arg) {
+      args[command.arg.name] =
+        command.arg.type === 'number'
+          ? text
+            ? Number(text)
+            : undefined
+          : text;
+    }
+
+    try {
+      await command.run(
+        prefixCtx(message),
+        args
+      );
+    } catch (e) {
+      console.error(
+        '[MESSAGE] Prefix command error:',
+        e
+      );
+
+      message
+        .reply(
+          err(
+            `Something went wrong: ${String(
+              e?.message || e
+            ).slice(0, 500)}`
+          )
+        )
+        .catch(() => {});
+    }
+  }
+);
+
+// ─────────────────────────────────────────────
+// CLIENT ERRORS
+// ─────────────────────────────────────────────
+
+client.on(
+  'error',
+  (error) => {
+    console.error(
+      '[CLIENT] Client error:',
+      error
+    );
+  }
+);
+
+process.on(
+  'unhandledRejection',
+  (error) => {
+    console.error(
+      '[PROCESS] Unhandled rejection:',
+      error
+    );
+  }
+);
+
+process.on(
+  'uncaughtException',
+  (error) => {
+    console.error(
+      '[PROCESS] Uncaught exception:',
+      error
+    );
+
+    process.exit(1);
+  }
+);
+
+// ─────────────────────────────────────────────
+// LOGIN
+// ─────────────────────────────────────────────
+
+client
+  .login(TOKEN)
+  .then(() => {
+    console.log(
+      '🔐 Discord login successful.'
+    );
+  })
+  .catch((error) => {
+    console.error(
+      `❌ Login failed: ${error.message}`
+    );
+
+    console.error(
+      'Check DISCORD_TOKEN in Railway Variables.'
+    );
+
+    process.exit(1);
+  });
