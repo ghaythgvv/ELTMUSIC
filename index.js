@@ -1724,24 +1724,36 @@ function slashCtx(interaction) {
 
     channel: interaction.channel,
 
-    defer: () =>
-      interaction
-        .deferReply()
-        .catch(() => {}),
-
-    reply: (payload) => {
+    // IMPORTANT:
+    // Do NOT swallow Discord interaction errors here.
+    // If deferReply fails, let the main interaction handler catch it.
+    defer: async () => {
       if (
         interaction.deferred ||
         interaction.replied
       ) {
-        return interaction
-          .editReply(payload)
-          .catch(() => {});
+        return;
       }
 
-      return interaction
-        .reply(payload)
-        .catch(() => {});
+      await interaction.deferReply();
+    },
+
+    // IMPORTANT:
+    // Do NOT use .catch(() => {}) here.
+    // Discord errors need to reach the main error handler.
+    reply: async (payload) => {
+      if (
+        interaction.deferred ||
+        interaction.replied
+      ) {
+        return interaction.editReply(
+          payload
+        );
+      }
+
+      return interaction.reply(
+        payload
+      );
     },
   };
 }
