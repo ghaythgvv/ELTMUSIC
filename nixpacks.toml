@@ -1,0 +1,3 @@
+# Installs a normal system ffmpeg on Railway (the bundled static one cannot read the streams).
+[phases.setup]
+nixPkgs = ["...", "ffmpeg"]
